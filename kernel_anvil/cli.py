@@ -343,14 +343,12 @@ def cmd_gguf_optimize(args):
     # Check GPU (skip if --no-bench)
     no_bench = getattr(args, "no_bench", False)
     if not no_bench and not torch.cuda.is_available():
-        console.print("[red]No GPU available. gguf-optimize requires a CUDA/ROCm GPU.[/red]")
-        console.print("[dim]Troubleshooting:[/dim]")
-        console.print("[dim]  - Verify: python -c \"import torch; print(torch.cuda.is_available())\"[/dim]")
-        console.print("[dim]  - ROCm users need the ROCm-specific PyTorch wheel:[/dim]")
-        console.print("[dim]    pip install torch --index-url https://download.pytorch.org/whl/rocm7.1/[/dim]")
-        console.print("[dim]  - Windows ROCm: ensure torch is the ROCm build, not CPU/CUDA[/dim]")
-        console.print("[dim]  - Or use --no-bench to generate heuristic configs without GPU[/dim]")
-        sys.exit(1)
+        console.print("[yellow]GPU not detected by PyTorch. Falling back to --no-bench mode.[/yellow]")
+        console.print("[dim]To enable GPU benchmarking, ensure PyTorch is the ROCm build:[/dim]")
+        console.print("[dim]  pip install torch --index-url https://download.pytorch.org/whl/rocm7.1/[/dim]")
+        console.print("[dim]Or try: kernel-anvil autoforge model.gguf (uses hipcc directly)[/dim]")
+        console.print()
+        no_bench = True
 
     if no_bench:
         gpu_spec = GFX1100  # Default heuristics
