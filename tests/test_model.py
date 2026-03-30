@@ -140,19 +140,14 @@ class TestSmithyLinearFallback:
             _ = sl(x)
             mock_linear.assert_called_once()
 
-    def test_single_token_does_not_use_fallback(self):
-        """M=1 should NOT call F.linear (it calls Triton GEMV)."""
+    def test_single_token_cpu_uses_fallback(self):
+        """M=1 on CPU should use F.linear fallback (Triton requires GPU)."""
         linear = nn.Linear(16, 8)
         sl = SmithyLinear(linear.weight.data.clone(), linear.bias.data.clone(), {})
-        x = torch.randn(1, 16)
-        with patch("kernel_anvil.model.F.linear") as mock_linear:
-            # This will fail on CPU (no Triton), so we just check that
-            # F.linear is NOT the code path attempted.
-            try:
-                _ = sl(x)
-            except Exception:
-                pass  # Triton not available on CPU is expected
-            mock_linear.assert_not_called()
+        x = torch.randn(1, 16)  # CPU tensor
+        with patch("kernel_anvil.model.F.linear", wraps=torch.nn.functional.linear) as mock_linear:
+            _ = sl(x)
+            mock_linear.assert_called_once()
 
     def test_total_tokens_computation(self):
         """Verify _total_tokens for various input shapes."""

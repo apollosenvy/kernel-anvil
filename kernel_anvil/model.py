@@ -57,7 +57,7 @@ class SmithyLinear(nn.Module):
         return 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._total_tokens(x) == 1:
+        if self._total_tokens(x) == 1 and x.is_cuda:
             return self._triton_gemv(x)
         return F.linear(x, self.weight, self.bias)
 

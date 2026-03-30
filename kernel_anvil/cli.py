@@ -1,6 +1,7 @@
 """CLI for kernel-anvil -- profile-guided Triton kernel optimizer."""
 import argparse
 import importlib.util
+import os
 import sys
 import time
 from pathlib import Path
@@ -443,16 +444,26 @@ def cmd_gguf_optimize(args):
     )
 
     # Write to ~/.cache/smithy/<model_basename>.json for auto-loading
+    # Must be ~/.cache/smithy/ to match llama.cpp's smithy-config.h lookup path
     model_basename = Path(args.gguf).stem  # e.g., "Qwen3-8B-Q4_K_M"
-    cache_dir = Path.home() / ".cache" / "kernel-anvil"
+    cache_dir = Path.home() / ".cache" / "smithy"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{model_basename}.json"
-    cache_path.write_text(json_config)
+    # Atomic write: write to temp file, then rename
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(cache_dir), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(json_config)
+        os.rename(tmp_path, str(cache_path))
+    except Exception:
+        os.unlink(tmp_path)
+        raise
     console.print(f"\n[bold green]Config cached to {cache_path}[/bold green]")
     console.print("[dim]llama.cpp will auto-load this on next model load.[/dim]")
 
-    # Also write C header if explicitly requested
-    if args.output != "smithy-config.h" or not cache_path.exists():
+    # Also write C header if --output was explicitly set
+    if args.output != "smithy-config.h":
         header = generate_config_header(
             codegen_configs,
             gpu_name=f"{gpu_spec.gfx} ({gpu_spec.name})",
