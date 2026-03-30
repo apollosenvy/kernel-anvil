@@ -25,7 +25,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kernel_anvil.gguf import parse_gguf
-from kernel_anvil.hip_codegen import KernelSpec, generate_q4k_kernel
+from kernel_anvil.hip_codegen import (
+    KernelSpec,
+    Q8_1_BLOCK_SIZE,
+    QUANT_TYPES,
+    QuantTypeInfo,
+    find_llama_cpp_path,
+    generate_kernel,
+    generate_q4k_kernel,
+    get_llama_cpp_include_dirs,
+    get_quant_info,
+)
 
 
 @dataclass
@@ -77,22 +87,30 @@ def _compile_and_bench(
     arch: str,
     warmup: int = 10,
     runs: int = 50,
+    llama_cpp_path: Path | None = None,
+    include_dirs: list[str] | None = None,
 ) -> BenchResult | None:
     """Generate, compile, and benchmark a single kernel config.
 
     Returns BenchResult or None if compilation/benchmark fails.
     """
-    if spec.quant_type != "Q4_K":
-        return None  # Only Q4_K codegen for now
+    quant_info = get_quant_info(spec.quant_type)
+    if quant_info is None:
+        return None  # Unsupported type (F16/F32/BF16 don't use MMVQ)
+
+    # Without llama.cpp headers, only Q4_K works via fallback
+    if llama_cpp_path is None and spec.quant_type != "Q4_K":
+        return None
 
     try:
-        src = generate_q4k_kernel(spec)
+        src = generate_kernel(spec, llama_cpp_path)
     except ValueError:
-        return None  # Shape not compatible (e.g., K not divisible by 256)
+        return None  # Shape not compatible (e.g., K not divisible by qk)
+
     N, K = spec.N, spec.K
-    blocks_per_row = K // 256
-    weight_bytes = N * blocks_per_row * 144
-    input_bytes = (K // 32) * 36
+    blocks_per_row = K // quant_info.qk
+    weight_bytes = N * blocks_per_row * quant_info.block_size
+    input_bytes = (K // 32) * Q8_1_BLOCK_SIZE
     data_bytes = weight_bytes + input_bytes
 
     # Generate a self-contained benchmark binary
@@ -105,9 +123,9 @@ def _compile_and_bench(
 
 int main() {{
     const int N = {N}, K = {K};
-    const int bpr = K / 256;
-    const size_t wb = (size_t)N * bpr * 144;
-    const size_t ib = (K / 32) * 36;
+    const int bpr = K / {quant_info.qk};
+    const size_t wb = (size_t)N * bpr * {quant_info.block_size};
+    const size_t ib = (K / 32) * {Q8_1_BLOCK_SIZE};
 
     void *dw, *di; float *dout;
     hipMalloc(&dw, wb);
@@ -153,10 +171,31 @@ int main() {{
         with open(src_path, "w") as f:
             f.write(bench_src)
 
+        # Build compile command
+        compile_cmd = ["hipcc", f"--offload-arch={arch}", "-O3"]
+        if include_dirs:
+            for d in include_dirs:
+                compile_cmd.extend(["-I", d])
+        # Architecture macros for llama.cpp headers
+        if "gfx1100" in arch or "gfx1101" in arch or "gfx1102" in arch:
+            compile_cmd.extend(["-DRDNA3_0", "-DRDNA3"])
+        elif "gfx1150" in arch or "gfx1151" in arch:
+            compile_cmd.extend(["-DRDNA3_5", "-DRDNA3"])
+        elif "gfx1200" in arch or "gfx1201" in arch:
+            compile_cmd.append("-DRDNA4")
+        elif "gfx1030" in arch or "gfx1031" in arch or "gfx1032" in arch:
+            compile_cmd.append("-DRDNA2")
+        elif "gfx1010" in arch or "gfx1012" in arch:
+            compile_cmd.append("-DRDNA1")
+        # Required HIP defines for ggml headers
+        compile_cmd.extend(["-DGGML_COMMON_DECL_HIP", "-DGGML_COMMON_IMPL_HIP", "-DGGML_USE_HIP"])
+        compile_cmd.append("-DMMVQ_MAX_BATCH_SIZE=8")
+        compile_cmd.extend(["-o", bin_path, src_path])
+
         # Compile
         try:
             result = subprocess.run(
-                ["hipcc", f"--offload-arch={arch}", "-O3", "-o", bin_path, src_path],
+                compile_cmd,
                 capture_output=True, text=True, timeout=60,
             )
             if result.returncode != 0:
@@ -196,6 +235,7 @@ def autoforge(
     arch: str | None = None,
     nwarps_candidates: list[int] | None = None,
     rpb_candidates: list[int] | None = None,
+    llama_cpp_path: str | None = None,
     verbose: bool = True,
 ) -> ForgeResult:
     """Full automated kernel forging pipeline.
@@ -206,6 +246,7 @@ def autoforge(
         arch: GPU arch string. Auto-detected if None.
         nwarps_candidates: nwarps values to try. Default [1, 2, 4, 8].
         rpb_candidates: rows_per_block values to try. Default [1, 2, 4].
+        llama_cpp_path: Path to llama.cpp source. Auto-detected if None.
         verbose: Print progress.
     """
     t0 = time.monotonic()
@@ -224,6 +265,23 @@ def autoforge(
     if verbose:
         print(f"GPU architecture: {arch}")
 
+    # Resolve llama.cpp path once for the whole run
+    resolved_llama_path: Path | None = None
+    if llama_cpp_path is not None:
+        resolved_llama_path = Path(llama_cpp_path)
+    else:
+        resolved_llama_path = find_llama_cpp_path()
+
+    include_dirs: list[str] | None = None
+    if resolved_llama_path is not None:
+        include_dirs = get_llama_cpp_include_dirs(resolved_llama_path)
+        if verbose:
+            print(f"llama.cpp headers: {resolved_llama_path}")
+            print(f"All MMVQ quant types supported ({len(QUANT_TYPES)} types)")
+    else:
+        if verbose:
+            print("llama.cpp headers: NOT FOUND (only Q4_K fallback available)")
+
     # 2. Parse model
     if verbose:
         print(f"Parsing {Path(model_path).name}...")
@@ -236,9 +294,16 @@ def autoforge(
     winners = {}
 
     for (qt, n, k), count in sorted(shapes.items()):
-        if qt != "Q4_K":
+        quant_info = get_quant_info(qt)
+        if quant_info is None:
             if verbose:
-                print(f"  {qt} ({n}, {k}) x{count}: skipped (only Q4_K supported)")
+                print(f"  {qt} ({n}, {k}) x{count}: SKIPPED (not an MMVQ type)")
+            continue
+
+        # Without llama.cpp headers, only Q4_K works via fallback
+        if resolved_llama_path is None and qt != "Q4_K":
+            if verbose:
+                print(f"  {qt} ({n}, {k}) x{count}: SKIPPED (no llama.cpp headers)")
             continue
 
         if verbose:
@@ -260,7 +325,11 @@ def autoforge(
                     nwarps=nw, rows_per_block=rpb,
                 )
 
-                result = _compile_and_bench(spec, arch)
+                result = _compile_and_bench(
+                    spec, arch,
+                    llama_cpp_path=resolved_llama_path,
+                    include_dirs=include_dirs,
+                )
                 configs_tested += 1
 
                 if result is not None:
@@ -272,7 +341,11 @@ def autoforge(
             speedup_vs_stock = ""
             # Compare vs nw=8 rpb=1 (stock config)
             stock_spec = KernelSpec(quant_type=qt, N=n, K=k, nwarps=8, rows_per_block=1)
-            stock = _compile_and_bench(stock_spec, arch)
+            stock = _compile_and_bench(
+                stock_spec, arch,
+                llama_cpp_path=resolved_llama_path,
+                include_dirs=include_dirs,
+            )
             if stock and best.latency_us > 0:
                 ratio = stock.latency_us / best.latency_us
                 speedup_vs_stock = f" ({ratio:.2f}x vs stock)"
@@ -320,8 +393,20 @@ def autoforge(
     elapsed = time.monotonic() - t0
 
     if verbose:
+        # Count skipped vs optimized
+        total_tensors = sum(shapes.values())
+        optimized_tensors = sum(shapes.get(k, 0) for k in winners)
+        skipped_tensors = total_tensors - optimized_tensors
+        skipped_types = set()
+        for (qt, _, _) in shapes:
+            if qt not in {q for q, _, _ in winners}:
+                skipped_types.add(qt)
         print(f"\nConfig written to {config_path}")
         print(f"Total time: {elapsed:.1f}s")
+        print(f"Optimized: {optimized_tensors}/{total_tensors} tensors "
+              f"({skipped_tensors} skipped)")
+        if skipped_types:
+            print(f"Skipped types: {', '.join(sorted(skipped_types))}")
         if winners:
             avg_bw = sum(r.bandwidth_gbs for r in winners.values()) / len(winners)
             print(f"Average bandwidth: {avg_bw:.0f} GB/s")
