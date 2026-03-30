@@ -18,11 +18,13 @@ llama-server -m model.gguf               # auto-loads optimized configs
 ## Install
 
 ```bash
-git clone https://github.com/garylaski/kernel-anvil.git
+git clone https://github.com/apollosenvy/kernel-anvil.git
 cd kernel-anvil && pip install -e ".[dev]"
 ```
 
-Requires: Python 3.10+, PyTorch 2.0+, Triton 3.0+, ROCm 6.0+
+Requires: Python 3.10+, PyTorch 2.0+ (with ROCm), Triton 3.0+
+
+> **ROCm Triton note:** If `pip install` fails on the Triton dependency, install the ROCm-compatible Triton wheel from [PyTorch's index](https://download.pytorch.org/whl/rocm7.1/): `pip install triton --index-url https://download.pytorch.org/whl/rocm7.1/`
 
 ## Usage
 
