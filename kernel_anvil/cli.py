@@ -513,11 +513,15 @@ def cmd_autoforge(args):
     console.print(f"\n[bold]Autoforge: generating optimized kernels for {Path(args.gguf).name}[/bold]")
     console.print(f"Sweeping nwarps={nwarps} x rpb={rpb} = {len(nwarps)*len(rpb)} configs per shape\n")
 
+    # Pass llama.cpp path if provided via CLI or env var
+    llama_cpp_path = getattr(args, "llama_cpp_path", None)
+
     result = autoforge(
         model_path=args.gguf,
         arch=args.arch,
         nwarps_candidates=nwarps,
         rpb_candidates=rpb,
+        llama_cpp_path=llama_cpp_path,
         verbose=True,
     )
 
@@ -612,6 +616,7 @@ def main():
     p_forge.add_argument("--arch", help="GPU arch (auto-detected if omitted)")
     p_forge.add_argument("--nwarps", default="1,2,4,8", help="nwarps to sweep (default: 1,2,4,8)")
     p_forge.add_argument("--rpb", default="1,2,4", help="rows_per_block to sweep (default: 1,2,4)")
+    p_forge.add_argument("--llama-cpp-path", help="Path to llama.cpp source (for headers). Also: LLAMA_CPP_PATH env var")
 
     # llama-sweep: sweep actual llama.cpp kernels via rocprofv3
     p_llama = sub.add_parser("llama-sweep", help="Sweep llama.cpp MMVQ kernel configs on actual hardware")
