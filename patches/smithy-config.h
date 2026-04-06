@@ -5,9 +5,9 @@
 // Docs: https://github.com/apollosenvy/kernel-anvil
 //
 // Config path (checked in order):
-//   1. SMITHY_CONFIG env var
-//   2. ~/.cache/smithy/<model_stem>.json
-//   3. ~/.cache/smithy/default.json
+//   1. SMITHY_CONFIG env var (explicit path to config JSON)
+//   2. ~/.cache/smithy/<model_stem>.json (requires smithy_set_model() or SMITHY_MODEL env var)
+//   3. ~/.cache/smithy/default.json (fallback)
 //
 // Format:
 //   { "configs": { "<type_idx>": { "<n_bucket>,<k_bucket>": {"nwarps": N, "rows_per_block": R} } } }
@@ -17,6 +17,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// GGML_TYPE_COUNT is defined in ggml.h when included inside a llama.cpp build.
+// Fallback for standalone compilation or static analysis.
+#ifndef GGML_TYPE_COUNT
+#define GGML_TYPE_COUNT 41
+#endif
 
 enum smithy_bucket : int {
     SMITHY_BUCKET_LE_128   = 0,
@@ -43,6 +49,21 @@ static inline smithy_bucket smithy_get_bucket(int dim) {
 static smithy_shape_config smithy_configs[GGML_TYPE_COUNT][SMITHY_NUM_BUCKETS][SMITHY_NUM_BUCKETS] = {};
 static bool smithy_configs_loaded  = false;
 static bool smithy_load_attempted  = false;
+static char smithy_model_path[512] = {};
+
+// Call this when loading a model so smithy can find model-specific configs.
+// path: full path to the GGUF file (e.g., "/home/user/models/Qwen3-8B-Q4_K_M.gguf")
+static void smithy_set_model(const char * path) {
+    if (!path) return;
+    size_t len = strlen(path);
+    if (len >= sizeof(smithy_model_path)) len = sizeof(smithy_model_path) - 1;
+    memcpy(smithy_model_path, path, len);
+    smithy_model_path[len] = '\0';
+    // Reset load state so the next lookup picks up the model-specific config
+    smithy_configs_loaded = false;
+    smithy_load_attempted = false;
+    memset(smithy_configs, 0, sizeof(smithy_configs));
+}
 
 static bool smithy_load_configs(const char * path) {
     FILE * f = fopen(path, "r");
@@ -125,12 +146,40 @@ static void smithy_try_load() {
     if (smithy_configs_loaded || smithy_load_attempted) return;
     smithy_load_attempted = true;
 
+    // Priority 1: SMITHY_CONFIG env var (explicit path)
     const char * env_path = getenv("SMITHY_CONFIG");
     if (env_path && smithy_load_configs(env_path)) return;
 
     const char * home = getenv("HOME");
     if (!home) return;
 
+    // Priority 2: ~/.cache/smithy/<model_stem>.json (model-specific)
+    // Model path source: smithy_set_model() API or SMITHY_MODEL env var.
+    const char * model_src = smithy_model_path;
+    const char * env_model = getenv("SMITHY_MODEL");
+    if (smithy_model_path[0] == '\0' && env_model) {
+        model_src = env_model;
+    }
+    if (model_src[0] != '\0') {
+        // Extract stem: find last '/' then strip extension
+        const char * base = strrchr(model_src, '/');
+        if (!base) base = strrchr(model_src, '\\');
+        base = base ? base + 1 : model_src;
+
+        char stem[256];
+        size_t stem_len = strlen(base);
+        const char * dot = strrchr(base, '.');
+        if (dot && dot > base) stem_len = (size_t)(dot - base);
+        if (stem_len >= sizeof(stem)) stem_len = sizeof(stem) - 1;
+        memcpy(stem, base, stem_len);
+        stem[stem_len] = '\0';
+
+        char model_path[512];
+        snprintf(model_path, sizeof(model_path), "%s/.cache/smithy/%s.json", home, stem);
+        if (smithy_load_configs(model_path)) return;
+    }
+
+    // Priority 3: ~/.cache/smithy/default.json (fallback)
     char default_path[512];
     snprintf(default_path, sizeof(default_path), "%s/.cache/smithy/default.json", home);
     smithy_load_configs(default_path);

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -49,6 +50,16 @@ class SweepResult:
     optimized_tps: float
 
 
+def _validate_sql_identifier(name: str) -> bool:
+    """Validate that a string is a safe SQL identifier (table/column name).
+
+    Only allows alphanumeric characters and underscores, starting with a
+    letter or underscore. Rejects everything else -- no quoting tricks,
+    no semicolons, no spaces.
+    """
+    return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name))
+
+
 def _parse_rocprof_db(db_path: str) -> list[KernelTiming]:
     """Parse rocprofv3 SQLite database for MMVQ kernel timings."""
     db = sqlite3.connect(db_path)
@@ -63,13 +74,19 @@ def _parse_rocprof_db(db_path: str) -> list[KernelTiming]:
         return []
 
     dispatch_table = tables[0]
-    uuid = dispatch_table.replace("rocpd_kernel_dispatch_", "")
-    # Validate UUID format to prevent SQL injection
-    import re
-    if not re.match(r'^[a-f0-9_]+$', uuid):
+
+    # Table names come from an external rocprofv3 database -- untrusted input.
+    # Validate both table names as safe SQL identifiers before interpolation.
+    if not _validate_sql_identifier(dispatch_table):
         db.close()
         return []
+
+    uuid = dispatch_table.replace("rocpd_kernel_dispatch_", "")
     symbol_table = f"rocpd_info_kernel_symbol_{uuid}"
+
+    if not _validate_sql_identifier(symbol_table):
+        db.close()
+        return []
 
     rows = db.execute(f"""
         SELECT ks.kernel_name,

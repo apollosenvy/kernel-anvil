@@ -483,7 +483,7 @@ def cmd_gguf_optimize(args):
         os.unlink(tmp_path)
         raise
     console.print(f"\n[bold green]Config cached to {cache_path}[/bold green]")
-    console.print("[dim]llama.cpp will auto-load this on next model load.[/dim]")
+    console.print(f"[dim]Run: SMITHY_MODEL={args.gguf} llama-server -m {args.gguf} -ngl 999[/dim]")
 
     # Also write C header if --output was explicitly set
     if args.output != "smithy-config.h":
