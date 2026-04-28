@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=60.0"]
+# setuptools>=77 is required for PEP 639 SPDX-string licenses
+# (`license = "Apache-2.0"` below). Older setuptools (60..76) reject the
+# SPDX form with "project.license must be valid exactly by one definition".
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]

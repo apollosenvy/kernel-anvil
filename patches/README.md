@@ -4,6 +4,12 @@ This patch adds runtime shape-specific MMVQ kernel configuration to llama.cpp.
 When kernel-anvil generates optimized configs for your model + GPU, this patch
 lets llama.cpp load them at startup.
 
+## Requirements
+
+`smithy-config.h` requires **C++17** (uses `std::atomic`, `std::shared_mutex`,
+`[[maybe_unused]]`, and capture lambdas). llama.cpp's CMake already targets
+C++17 by default, so no extra flags are needed for the upstream tree.
+
 ## Quick Apply
 
 ```bash

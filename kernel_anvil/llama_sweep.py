@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,10 +65,19 @@ def _parse_rocprof_db(db_path: str) -> list[KernelTiming]:
     """Parse rocprofv3 SQLite database for MMVQ kernel timings."""
     db = sqlite3.connect(db_path)
 
-    # Find the UUID suffix for this run's tables
+    # Find the UUID suffix for this run's tables. Use ESCAPE so the literal
+    # underscores in the prefix don't act as LIKE single-char wildcards
+    # (which would match e.g. 'rocpd_kernel_dispatchABC' and pass the
+    # safe-identifier validator while later pointing at a non-existent
+    # symbol table).
     tables = [r[0] for r in db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'rocpd_kernel_dispatch_%'"
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        r"AND name LIKE 'rocpd\_kernel\_dispatch\_%' ESCAPE '\'"
     ).fetchall()]
+
+    # Defensive belt-and-braces: even with the escape, only accept names
+    # that literally start with the expected prefix.
+    tables = [t for t in tables if t.startswith("rocpd_kernel_dispatch_")]
 
     if not tables:
         db.close()
@@ -88,18 +98,24 @@ def _parse_rocprof_db(db_path: str) -> list[KernelTiming]:
         db.close()
         return []
 
-    rows = db.execute(f"""
-        SELECT ks.kernel_name,
-               COUNT(*) as calls,
-               SUM(d.end - d.start) / 1000.0 as total_us,
-               AVG(d.end - d.start) / 1000.0 as avg_us,
-               d.grid_size_x
-        FROM {dispatch_table} d
-        JOIN {symbol_table} ks ON d.kernel_id = ks.id
-        WHERE ks.kernel_name LIKE '%mul_mat_vec_q%'
-        GROUP BY ks.kernel_name, d.grid_size_x
-        ORDER BY total_us DESC
-    """).fetchall()
+    try:
+        rows = db.execute(f"""
+            SELECT ks.kernel_name,
+                   COUNT(*) as calls,
+                   SUM(d.end - d.start) / 1000.0 as total_us,
+                   AVG(d.end - d.start) / 1000.0 as avg_us,
+                   d.grid_size_x
+            FROM {dispatch_table} d
+            JOIN {symbol_table} ks ON d.kernel_id = ks.id
+            WHERE ks.kernel_name LIKE '%mul_mat_vec_q%'
+            GROUP BY ks.kernel_name, d.grid_size_x
+            ORDER BY total_us DESC
+        """).fetchall()
+    except sqlite3.OperationalError:
+        # Malformed rocprof DB (e.g., missing the symbol table). Don't crash
+        # the whole sweep -- treat as "no timings available".
+        db.close()
+        return []
 
     timings = []
     for name, calls, total_us, avg_us, grid_x in rows:
@@ -177,10 +193,12 @@ def _run_bench_with_config(
 def _gen_config(nwarps: int, shapes: dict) -> str:
     """Generate a smithy JSON config with uniform nwarps for all shapes."""
     configs: dict[str, dict] = {}
+    skipped_types: set[str] = set()
 
     for (qt_name, n, k), count in shapes.items():
         type_idx = GGML_TYPE_MAP.get(qt_name)
         if type_idx is None:
+            skipped_types.add(qt_name)
             continue
 
         ni = bucket_index(n)
@@ -194,6 +212,16 @@ def _gen_config(nwarps: int, shapes: dict) -> str:
             "nwarps": nwarps,
             "rows_per_block": 1,
         }
+
+    if skipped_types:
+        # Loud warning so users know the GGML_TYPE_MAP needs an update when
+        # a model uses a quant kernel-anvil doesn't yet recognize. Silent
+        # drops here mean those layers never get tuned.
+        sys.stderr.write(
+            "kernel-anvil: warning: skipped untuned quant types "
+            f"(unknown to GGML_TYPE_MAP): {sorted(skipped_types)}. "
+            "Add them to kernel_anvil/codegen.py:GGML_TYPE_MAP.\n"
+        )
 
     return json.dumps({"gpu": "auto", "model": "sweep", "configs": configs}, indent=2)
 

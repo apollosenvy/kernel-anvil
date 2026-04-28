@@ -323,12 +323,17 @@ def optimize(
 
     # Resolve config for each unique shape
     shape_configs: dict[str, dict] = {}
+    newly_tuned: set[str] = set()  # shape_keys we actually tuned this run
     for (N, K), members in shapes.items():
         shape_key = f"({N}, {K})"
 
         if cached and shape_key in cached:
             config = cached[shape_key]
-        elif has_gpu and not cached:
+        elif has_gpu:
+            # Either no cache at all OR cache exists but is missing this
+            # shape. Tune it. (Previously: a partial cache miss silently
+            # fell through to defaults, locking new shapes added to a model
+            # post-cache out of optimization.)
             if verbose:
                 print(f"[kernel-anvil] Tuning shape {shape_key}...", end=" ", flush=True)
             t0 = time.monotonic()
@@ -337,8 +342,11 @@ def optimize(
             if verbose:
                 cfg_str = " ".join(f"{k}={v}" for k, v in sorted(config.items()))
                 print(f"done ({dt:.1f}s) -> {cfg_str}")
+            newly_tuned.add(shape_key)
         else:
-            # No GPU or no cache -- use defaults
+            # No GPU available -- use defaults. NOT a tuning result;
+            # MUST NOT be persisted to the cache (would poison future
+            # GPU-equipped runs into thinking these shapes were tuned).
             config = dict(_DEFAULT_CONFIG)
 
         shape_configs[shape_key] = config
@@ -356,8 +364,17 @@ def optimize(
     if verbose:
         print(f"[kernel-anvil] Replaced {replaced} nn.Linear layers with SmithyLinear")
 
-    # Save configs to cache
-    if not cached or _force_tune:
+    # Save configs to cache. Save when:
+    #   * no cache existed (write whatever we resolved -- preserves the
+    #     pre-existing UX where running optimize() on a CPU model still
+    #     produces a cache file), or
+    #   * --force_tune was requested, or
+    #   * a partial-miss run tuned at least one new shape.
+    # CRUCIALLY: do NOT save when there's already a cache and the only
+    # "fresh" entries this run are default-fallback configs from the no-GPU
+    # path. That would overwrite a partial cache with never-tuned defaults
+    # and poison future GPU-equipped runs into treating them as cache hits.
+    if _force_tune or not cached or newly_tuned:
         _save_configs(cache_file, shape_configs)
         if verbose:
             print(f"[kernel-anvil] Saved configs to {cache_file}")

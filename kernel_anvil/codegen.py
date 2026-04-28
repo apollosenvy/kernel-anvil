@@ -7,7 +7,6 @@ to select per-shape kernel configs at runtime.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -68,12 +67,26 @@ def _bucket_label(idx: int) -> str:
 
 def build_config_tables(
     configs: dict[tuple[str, int, int], dict],
+    priorities: dict[tuple[str, int, int], float] | None = None,
 ) -> dict[str, list[list[ShapeConfig]]]:
     """Build bucketed config tables from sweep results.
+
+    Multiple (qt, N, K) triples can land in the same (qt, n_bucket, k_bucket)
+    cell. By default, the last (qt, N, K) entry that maps to a given cell
+    wins (iteration order over the configs dict). When ``priorities`` is
+    provided, the highest-priority entry wins per cell -- use the profiled
+    speedup so the better-performing config survives the bucket collision
+    (relevant for merging configs from multiple models, e.g. speculative
+    decoding target + draft pairs). NaN or missing priorities are coerced
+    to -inf so well-defined priorities always win over malformed ones.
 
     Args:
         configs: Mapping of (quant_type, N, K) -> {"nwarps": int, "rows_per_block": int}.
             The quant_type should match one of QUANT_TYPES (e.g. "Q4_K").
+        priorities: Optional parallel mapping of (quant_type, N, K) -> float
+            (typically profiled speedup). When two entries collide on a bucket
+            cell, the one with the higher priority wins. Missing keys are
+            treated as priority -inf.
 
     Returns:
         Dict mapping quant_type -> 2D list [n_bucket][k_bucket] of ShapeConfig.
@@ -81,23 +94,36 @@ def build_config_tables(
     """
     tables: dict[str, list[list[ShapeConfig]]] = {}
 
-    # Collect all quant types present in the data
     present_types = sorted({qt for qt, _, _ in configs})
 
     for qt in present_types:
-        # Initialize with defaults
         table = [[DEFAULT_CONFIG] * NUM_BUCKETS for _ in range(NUM_BUCKETS)]
+        cell_priority: dict[tuple[int, int], float] = {}
 
-        # Fill in sweep results
         for (q, n, k), cfg in configs.items():
             if q != qt:
                 continue
             ni = bucket_index(n)
             ki = bucket_index(k)
-            table[ni][ki] = ShapeConfig(
+            shape_cfg = ShapeConfig(
                 nwarps=cfg["nwarps"],
                 rows_per_block=cfg["rows_per_block"],
             )
+            if priorities is not None:
+                p = priorities.get((q, n, k))
+                # NaN must NOT win or lose silently: NaN compares False both
+                # ways, which would let it always overwrite a real priority.
+                # Treat NaN/None as -inf so well-defined priorities always
+                # win over malformed ones.
+                if p is None:
+                    p_val = float("-inf")
+                else:
+                    pf = float(p)
+                    p_val = float("-inf") if pf != pf else pf  # pf != pf <=> NaN
+                if (ni, ki) in cell_priority and p_val <= cell_priority[(ni, ki)]:
+                    continue
+                cell_priority[(ni, ki)] = p_val
+            table[ni][ki] = shape_cfg
 
         tables[qt] = table
 
@@ -108,6 +134,7 @@ def generate_runtime_config(
     configs: dict[tuple[str, int, int], dict],
     gpu_name: str = "gfx1100",
     model_name: str = "unknown",
+    priorities: dict[tuple[str, int, int], float] | None = None,
 ) -> str:
     """Generate a JSON config file for llama.cpp runtime loading.
 
@@ -126,10 +153,14 @@ def generate_runtime_config(
         }
       }
     }
+
+    When ``priorities`` is provided (typically per-shape profiled speedup),
+    bucket-cell collisions resolve to the higher-priority entry. This is how
+    speculative-decoding configs from a target+draft pair are merged.
     """
     import json
 
-    tables = build_config_tables(configs)
+    tables = build_config_tables(configs, priorities=priorities)
 
     out = {"gpu": gpu_name, "model": model_name, "configs": {}}
 
@@ -150,6 +181,83 @@ def generate_runtime_config(
             out["configs"][str(type_idx)] = type_configs
 
     return json.dumps(out, indent=2)
+
+
+def merge_runtime_configs(
+    payloads: list[dict],
+    gpu_name: str | None = None,
+    model_name: str | None = None,
+) -> dict:
+    """Merge already-serialized runtime config payloads (loaded from JSON).
+
+    Used to combine configs from multiple ``gguf-optimize`` runs (e.g. a
+    speculative-decoding target + draft pair) into a single config that
+    llama.cpp loads via SMITHY_CONFIG.
+
+    Resolution policy: first-seen wins. Earlier payloads in ``payloads`` take
+    priority over later ones for any overlapping (type_idx, n_bucket, k_bucket)
+    cell. Callers control priority via argument order -- pass the most
+    important model (typically the target) first.
+
+    Malformed payloads (non-dict at any level: payload, configs map, per-type
+    map, individual cell config) are silently skipped rather than raising,
+    so partial / mistyped JSON degrades to omitted entries instead of
+    crashing the whole merge.
+
+    Args:
+        payloads: List of parsed JSON payloads, each shaped like
+            ``{"gpu": ..., "model": ..., "configs": {type_idx: {"n,k": {...}}}}``.
+        gpu_name: Override for the merged ``gpu`` field. If None, uses the
+            first payload's value (or "unknown").
+        model_name: Override for the merged ``model`` field. If None, joins
+            the input model names with ``+``.
+
+    Returns:
+        A merged payload dict in the same shape, ready for ``json.dumps``.
+    """
+    if not payloads:
+        return {"gpu": gpu_name or "unknown", "model": model_name or "merged", "configs": {}}
+
+    # Defensively skip malformed payloads / configs / cells rather than
+    # raising an AttributeError into the caller. The CLI loads these from
+    # user-supplied JSON, so partial / mistyped data must degrade to "skip
+    # this entry" instead of crashing the whole merge.
+    merged_configs: dict[str, dict[str, dict]] = {}
+    valid_payloads: list[dict] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        valid_payloads.append(payload)
+        cfgs = payload.get("configs") or {}
+        if not isinstance(cfgs, dict):
+            continue
+        for type_idx, cells in cfgs.items():
+            if not isinstance(cells, dict):
+                continue
+            type_bucket = merged_configs.setdefault(str(type_idx), {})
+            for cell_key, cell_cfg in cells.items():
+                if cell_key in type_bucket:
+                    continue  # first-seen wins
+                if not isinstance(cell_cfg, dict):
+                    continue
+                type_bucket[str(cell_key)] = dict(cell_cfg)
+
+    if gpu_name is not None:
+        out_gpu = gpu_name
+    else:
+        gpu_field = valid_payloads[0].get("gpu") if valid_payloads else None
+        out_gpu = gpu_field if isinstance(gpu_field, str) else "unknown"
+
+    if model_name is not None:
+        out_model = model_name
+    else:
+        names = []
+        for p in valid_payloads:
+            m = p.get("model")
+            names.append(m if isinstance(m, str) else "unknown")
+        out_model = "+".join(names) if names else "merged"
+
+    return {"gpu": out_gpu, "model": out_model, "configs": merged_configs}
 
 
 def generate_config_header(

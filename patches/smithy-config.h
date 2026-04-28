@@ -14,9 +14,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <shared_mutex>
 
 // GGML_TYPE_COUNT is defined in ggml.h when included inside a llama.cpp build.
 // Fallback for standalone compilation or static analysis.
@@ -47,21 +50,39 @@ static inline smithy_bucket smithy_get_bucket(int dim) {
 }
 
 static smithy_shape_config smithy_configs[GGML_TYPE_COUNT][SMITHY_NUM_BUCKETS][SMITHY_NUM_BUCKETS] = {};
-static bool smithy_configs_loaded  = false;
-static bool smithy_load_attempted  = false;
+static std::atomic<bool> smithy_configs_loaded{false};
+static std::atomic<bool> smithy_load_attempted{false};
 static char smithy_model_path[512] = {};
+// Serializes initialization and reset of smithy_configs[] / smithy_*_path /
+// load flags. llama.cpp's MMVQ dispatch path can be entered from multiple
+// host threads (multi-stream batching, draft+target during speculative
+// decoding). The mutex is shared:
+//   * smithy_lookup() (the hot per-dispatch read path) takes a SHARED lock
+//     so concurrent readers don't serialize on each other.
+//   * smithy_set_model() and smithy_try_load() take an EXCLUSIVE lock so
+//     the memset and cell-by-cell load complete before any reader observes
+//     the table -- otherwise readers could see a half-zeroed table or
+//     mid-update cells during a model swap.
+static std::shared_mutex smithy_load_mutex;
 
 // Call this when loading a model so smithy can find model-specific configs.
 // path: full path to the GGUF file (e.g., "/home/user/models/Qwen3-8B-Q4_K_M.gguf")
-static void smithy_set_model(const char * path) {
+[[maybe_unused]] static void smithy_set_model(const char * path) {
     if (!path) return;
+    // Exclusive lock: blocks all readers + other writers for the duration
+    // of the reset. Without this, a reader holding a shared lock could see
+    // smithy_configs[][][] mid-memset.
+    std::unique_lock<std::shared_mutex> guard(smithy_load_mutex);
     size_t len = strlen(path);
     if (len >= sizeof(smithy_model_path)) len = sizeof(smithy_model_path) - 1;
     memcpy(smithy_model_path, path, len);
     smithy_model_path[len] = '\0';
-    // Reset load state so the next lookup picks up the model-specific config
-    smithy_configs_loaded = false;
-    smithy_load_attempted = false;
+    // Clear load flags BEFORE memsetting the table. If the order were
+    // reversed, an early-returning reader (which is checking the loaded
+    // flag with acquire ordering before snatching its shared lock) could
+    // see loaded==true paired with a partially-zeroed table.
+    smithy_configs_loaded.store(false, std::memory_order_release);
+    smithy_load_attempted.store(false, std::memory_order_release);
     memset(smithy_configs, 0, sizeof(smithy_configs));
 }
 
@@ -81,70 +102,180 @@ static bool smithy_load_configs(const char * path) {
     buf[nread] = '\0';
 
     int loaded = 0;
-    const char * p = strstr(buf, "\"configs\"");
-    if (!p) { free(buf); return false; }
+    const char * configs_anchor = strstr(buf, "\"configs\"");
+    if (!configs_anchor) { free(buf); return false; }
 
-    while ((p = strchr(p, '"')) != NULL) {
-        p++;
-        int type_idx = -1;
-        if (*p >= '0' && *p <= '9') {
-            type_idx = atoi(p);
-            p = strchr(p, '{');
-            if (!p || type_idx < 0 || type_idx >= GGML_TYPE_COUNT) continue;
+    const char * buf_end = buf + size;
 
-            const char * type_end = NULL;
-            int depth = 1;
-            const char * scan = p + 1;
-            while (*scan && depth > 0) {
-                if (*scan == '{') depth++;
-                if (*scan == '}') depth--;
-                if (depth == 0) { type_end = scan; break; }
-                scan++;
+    // Skip a JSON string starting at `c` (which points at the opening '"').
+    // Advances past the closing '"', honoring backslash escapes. Returns the
+    // position immediately after the closing quote, or `end` if the string
+    // is unterminated. Critical for the depth scanners below: a '}' inside
+    // a JSON string (e.g. {"comment":"see }"}) must NOT be counted as an
+    // object close, otherwise siblings get silently dropped or
+    // re-attributed.
+    auto skip_string = [](const char * c, const char * end) -> const char * {
+        c++;  // past opening '"'
+        while (c < end && *c != '"') {
+            if (*c == '\\' && c + 1 < end) c += 2;
+            else c++;
+        }
+        if (c < end) c++;  // past closing '"'
+        return c;
+    };
+
+    // Find the matching '}' that closes the object opened at `open_brace`,
+    // honoring string-literal context so quoted braces don't confuse the
+    // depth count. Returns NULL if no balanced close is found before `end`.
+    auto find_matching_close = [&](const char * open_brace, const char * end) -> const char * {
+        if (!open_brace || *open_brace != '{') return NULL;
+        int depth = 1;
+        const char * c = open_brace + 1;
+        while (c < end && depth > 0) {
+            if (*c == '"') {
+                c = skip_string(c, end);
+                continue;
             }
-            if (!type_end) break;
+            if (*c == '{') depth++;
+            else if (*c == '}') {
+                depth--;
+                if (depth == 0) return c;
+            }
+            c++;
+        }
+        return NULL;
+    };
 
-            const char * entry = p;
-            while (entry < type_end) {
-                entry = strchr(entry, '"');
-                if (!entry || entry >= type_end) break;
-                entry++;
+    // Scans forward from `p` looking for the '{' that opens a JSON object
+    // VALUE associated with the most recently seen quoted key. Returns NULL
+    // if the value at this position is anything other than an object
+    // (string, number, null, true/false, etc.) -- this prevents malformed
+    // entries from letting strchr() blindly jump into the next sibling and
+    // mis-attribute its data. `end` bounds the scan.
+    auto find_object_value = [](const char * key_close_quote, const char * end) -> const char * {
+        if (!key_close_quote || key_close_quote >= end) return NULL;
+        const char * c = key_close_quote;
+        // skip the closing '"' if we're sitting on it
+        if (*c == '"') c++;
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r')) c++;
+        if (c >= end || *c != ':') return NULL;
+        c++;
+        while (c < end && (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r')) c++;
+        if (c < end && *c == '{') return c;
+        return NULL;
+    };
 
-                int nb = -1, kb = -1;
-                if (sscanf(entry, "%d,%d", &nb, &kb) == 2 &&
-                    nb >= 0 && nb < SMITHY_NUM_BUCKETS &&
-                    kb >= 0 && kb < SMITHY_NUM_BUCKETS) {
+    // Bound the outer scan to the configs object's body. Without this the
+    // outer loop walks the entire remainder of the buffer and can pick up
+    // sibling top-level keys (e.g. {"configs": {...}, "telemetry":
+    // {"5": {"2,2": {...}}}}) as kernel configs.
+    const char * configs_brace = find_object_value(
+        configs_anchor + strlen("\"configs\""), buf_end);
+    if (!configs_brace) { free(buf); return false; }
+    const char * configs_end = find_matching_close(configs_brace, buf_end);
+    if (!configs_end) { free(buf); return false; }
 
-                    const char * nw_key  = strstr(entry, "\"nwarps\"");
-                    const char * rpb_key = strstr(entry, "\"rows_per_block\"");
-                    if (nw_key && nw_key < type_end && rpb_key && rpb_key < type_end) {
-                        int nw = 0, rpb = 0;
-                        const char * nw_val  = strchr(nw_key + 8, ':');
-                        const char * rpb_val = strchr(rpb_key + 16, ':');
-                        if (nw_val)  nw  = atoi(nw_val + 1);
-                        if (rpb_val) rpb = atoi(rpb_val + 1);
-                        if (nw > 0 && nw <= 32 && rpb > 0 && rpb <= 32) {
-                            smithy_configs[type_idx][nb][kb] = {nw, rpb};
-                            loaded++;
-                        }
+    const char * p = configs_brace;
+    while ((p = strchr(p, '"')) != NULL && p < configs_end) {
+        p++;
+        if (*p < '0' || *p > '9') continue;
+        int type_idx = atoi(p);
+
+        // Locate the closing quote of this digit key.
+        const char * key_close = strchr(p, '"');
+        if (!key_close || key_close >= configs_end) break;
+
+        // The value MUST be an object. If it's anything else (e.g. a
+        // string like "12":"oops"), skip the key and resume scanning --
+        // do NOT use strchr(p, '{') which would silently jump into the
+        // next sibling type's body and mis-attribute its cells under
+        // this type's index.
+        const char * type_brace = find_object_value(key_close, configs_end);
+        if (!type_brace) {
+            p = key_close + 1;
+            continue;
+        }
+
+        if (type_idx < 0 || type_idx >= GGML_TYPE_COUNT) {
+            // Skip past this type's body without parsing it.
+            p = type_brace;
+            continue;
+        }
+
+        const char * type_end = find_matching_close(type_brace, configs_end);
+        if (!type_end) break;
+
+        const char * entry = type_brace;
+        while (entry < type_end) {
+            entry = strchr(entry, '"');
+            if (!entry || entry >= type_end) break;
+            entry++;
+
+            int nb = -1, kb = -1;
+            if (sscanf(entry, "%d,%d", &nb, &kb) == 2 &&
+                nb >= 0 && nb < SMITHY_NUM_BUCKETS &&
+                kb >= 0 && kb < SMITHY_NUM_BUCKETS) {
+
+                // Locate the closing quote of THIS cell's bucket key.
+                const char * key_q = strchr(entry, '"');
+                if (!key_q || key_q >= type_end) break;
+
+                // The cell value MUST be an object. If it's a string,
+                // null, number, etc., skip the cell -- do NOT use
+                // strchr(entry, '{') which would jump into the next
+                // sibling cell and steal its data.
+                const char * cell_open = find_object_value(key_q, type_end);
+                if (!cell_open) {
+                    entry = key_q + 1;
+                    continue;
+                }
+
+                const char * cell_end = find_matching_close(cell_open, type_end);
+                if (!cell_end) break;
+
+                // nwarps / rows_per_block searches are bound by THIS
+                // cell's closing brace, not the type's.
+                const char * nw_key  = strstr(cell_open, "\"nwarps\"");
+                const char * rpb_key = strstr(cell_open, "\"rows_per_block\"");
+                if (nw_key && nw_key < cell_end && rpb_key && rpb_key < cell_end) {
+                    int nw = 0, rpb = 0;
+                    const char * nw_val  = strchr(nw_key + 8, ':');
+                    const char * rpb_val = strchr(rpb_key + 16, ':');
+                    if (nw_val  && nw_val  < cell_end) nw  = atoi(nw_val + 1);
+                    if (rpb_val && rpb_val < cell_end) rpb = atoi(rpb_val + 1);
+                    if (nw > 0 && nw <= 32 && rpb > 0 && rpb <= 32) {
+                        smithy_configs[type_idx][nb][kb] = {nw, rpb};
+                        loaded++;
                     }
                 }
-                entry++;
+                entry = cell_end + 1;
+                continue;
             }
-            p = type_end + 1;
+            entry++;
         }
+        p = type_end + 1;
     }
 
     free(buf);
-    smithy_configs_loaded = (loaded > 0);
-    if (smithy_configs_loaded) {
+    bool ok = (loaded > 0);
+    smithy_configs_loaded.store(ok, std::memory_order_release);
+    if (ok) {
         fprintf(stderr, "kernel-anvil: loaded %d shape configs from %s\n", loaded, path);
     }
-    return smithy_configs_loaded;
+    return ok;
 }
 
 static void smithy_try_load() {
-    if (smithy_configs_loaded || smithy_load_attempted) return;
-    smithy_load_attempted = true;
+    // Fast path: already loaded or already attempted (atomic acquire so any
+    // writes to smithy_configs[] are visible after we return).
+    if (smithy_configs_loaded.load(std::memory_order_acquire)) return;
+    if (smithy_load_attempted.load(std::memory_order_acquire)) return;
+
+    std::unique_lock<std::shared_mutex> guard(smithy_load_mutex);
+    // Re-check under lock (another thread may have loaded while we waited).
+    if (smithy_configs_loaded.load(std::memory_order_relaxed)) return;
+    if (smithy_load_attempted.load(std::memory_order_relaxed)) return;
+    smithy_load_attempted.store(true, std::memory_order_release);
 
     // Priority 1: SMITHY_CONFIG env var (explicit path)
     const char * env_path = getenv("SMITHY_CONFIG");
@@ -185,9 +316,15 @@ static void smithy_try_load() {
     smithy_load_configs(default_path);
 }
 
-static inline smithy_shape_config smithy_lookup(int type_idx, int nrows, int ncols) {
+[[maybe_unused]] static inline smithy_shape_config smithy_lookup(int type_idx, int nrows, int ncols) {
     smithy_try_load();
-    if (!smithy_configs_loaded || type_idx < 0 || type_idx >= GGML_TYPE_COUNT) {
+    // Shared lock: synchronizes with smithy_set_model() / smithy_try_load()
+    // exclusive locks so we never read smithy_configs[][][] mid-memset or
+    // mid-cell-write. Cheap when uncontended (atomic refcount), correct
+    // under contention (writers wait for readers to drain before reset).
+    std::shared_lock<std::shared_mutex> guard(smithy_load_mutex);
+    if (!smithy_configs_loaded.load(std::memory_order_acquire) ||
+        type_idx < 0 || type_idx >= GGML_TYPE_COUNT) {
         return {0, 0};
     }
     return smithy_configs[type_idx][smithy_get_bucket(nrows)][smithy_get_bucket(ncols)];

@@ -1,0 +1,16 @@
+# Include the llama.cpp integration patch + apply script. README directs
+# users to `cd kernel-anvil/patches && ./apply.sh`, so the sdist must
+# carry that directory.
+recursive-include patches *
+
+# Include example Triton runner scripts referenced from README usage.
+recursive-include examples *
+
+include LICENSE
+include README.md
+
+# Don't ship build artifacts in the sdist.
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude .DS_Store

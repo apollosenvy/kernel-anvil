@@ -1,5 +1,7 @@
 """Tests for RDNA3 hardware constants and occupancy calculations."""
-from kernel_anvil.rdna3 import GFX1100, GFX1101, GFX1102, GPU_SPECS, GpuSpec
+from unittest.mock import patch
+
+from kernel_anvil.rdna3 import GFX1100, GFX1101, GFX1102, GPU_SPECS, GpuSpec, detect_gpu
 
 
 def test_max_vgpr_waves_128():
@@ -100,3 +102,40 @@ def test_all_specs_wave_size_32():
 
 def test_gfx1102_lower_bandwidth():
     assert GFX1102.peak_bandwidth_gbs < GFX1101.peak_bandwidth_gbs < GFX1100.peak_bandwidth_gbs
+
+
+# detect_gpu name-matching: ROCm reports several iGPUs as 'AMD Radeon Graphics'
+# generically. The substring 'radeon graphics' must NOT classify them as a
+# 7900 XTX (96 CUs, 960 GB/s) -- that produced wildly wrong occupancy and
+# bandwidth heuristics for any iGPU user.
+
+def _detect_with_name(fake_name: str):
+    """Run detect_gpu against a synthesized torch.cuda device name. We also
+    suppress the rocm-smi short-circuit so the torch path actually runs --
+    on the host's real 7900 XTX, rocm-smi would otherwise short-circuit to
+    GFX1100 regardless of the synthesized name."""
+    import subprocess
+    import torch
+    fake_rocm_smi_result = subprocess.CompletedProcess(
+        args=["rocm-smi", "--showproductname"], returncode=0, stdout="", stderr=""
+    )
+    with patch("subprocess.run", return_value=fake_rocm_smi_result), \
+         patch.object(torch.cuda, "is_available", return_value=True), \
+         patch.object(torch.cuda, "get_device_name", return_value=fake_name):
+        return detect_gpu()
+
+
+def test_detect_gpu_does_not_classify_generic_radeon_graphics_as_7900xtx():
+    # An iGPU reported as 'AMD Radeon Graphics' (no specific model string)
+    # must return None -- not GFX1100, not any other GFX spec. Pinning the
+    # exact behavior catches a regression where the substring match falls
+    # back to a different RDNA3 desktop spec by accident.
+    assert _detect_with_name("AMD Radeon Graphics") is None
+
+
+def test_detect_gpu_still_matches_7900_xtx():
+    assert _detect_with_name("AMD Radeon RX 7900 XTX") is GFX1100
+
+
+def test_detect_gpu_still_matches_gfx1100():
+    assert _detect_with_name("gfx1100") is GFX1100
