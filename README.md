@@ -2,7 +2,7 @@
 
 Profile-guided GPU kernel optimizer for AMD. Reads a GGUF model, profiles each layer's GEMV shape on your GPU, and generates optimal kernel configs that llama.cpp loads at runtime. No recompilation needed.
 
-**2x decode speedup on Qwen3.5-27B** (12 -> 27 tok/s on a 7900 XTX) from shape-specific kernel tuning alone.
+**2.25x decode speedup on Qwen3.5-27B** (12 -> 27 tok/s on a 7900 XTX) from shape-specific kernel tuning alone.
 
 ## How It Works
 
@@ -47,8 +47,41 @@ SMITHY_CONFIG=~/.cache/smithy/Qwen3-8B-Q4_K_M.json \
 
 On startup:
 ```
-smithy: loaded 6 shape-specific kernel configs from ~/.cache/smithy/Qwen3-8B-Q4_K_M.json
+kernel-anvil: loaded 6 shape configs from ~/.cache/smithy/Qwen3-8B-Q4_K_M.json
 ```
+
+### Speculative decoding (target + draft)
+
+llama.cpp's speculative decoding loads two models concurrently (a large target plus a small draft). Both run through the same MMVQ dispatch path, so a single merged config covers both.
+
+The simplest path is to profile both models in one shot:
+
+```bash
+kernel-anvil gguf-optimize ~/Models/Qwen3-8B-Q4_K_M.gguf \
+    --draft ~/Models/Qwen3-0.6B-Q4_K_M.gguf
+
+SMITHY_CONFIG=~/.cache/smithy/Qwen3-8B-Q4_K_M.json \
+    llama-server -m ~/Models/Qwen3-8B-Q4_K_M.gguf \
+                 -md ~/Models/Qwen3-0.6B-Q4_K_M.gguf -ngl 999
+```
+
+`--draft` may be passed more than once to register multiple draft candidates. When two profiled shapes from different models land in the same `(quant, N_bucket, K_bucket)` cell, the config with the better profiled speedup wins.
+
+If you already have separate caches from earlier `gguf-optimize` runs, merge them:
+
+```bash
+kernel-anvil merge-configs \
+    ~/.cache/smithy/Qwen3-8B-Q4_K_M.json \
+    ~/.cache/smithy/Qwen3-0.6B-Q4_K_M.json \
+    -o ~/.cache/smithy/spec-decode.json
+
+SMITHY_CONFIG=~/.cache/smithy/spec-decode.json \
+    llama-server -m target.gguf -md draft.gguf -ngl 999
+```
+
+Argument order is priority order -- the first input wins on bucket-cell conflicts. Pass the target first.
+
+No llama.cpp patch changes are needed for either workflow; the runtime loader is already model-agnostic.
 
 ### Profile a Triton kernel
 
@@ -56,6 +89,16 @@ smithy: loaded 6 shape-specific kernel configs from ~/.cache/smithy/Qwen3-8B-Q4_
 kernel-anvil sweep examples/simple_gemv.py
 kernel-anvil profile examples/simple_gemv.py
 ```
+
+### Other commands
+
+| Command | Purpose |
+|---------|---------|
+| `autoforge <gguf>` | Generate, compile, and benchmark shape-specific HIP kernels via hipcc |
+| `llama-sweep <gguf>` | Sweep llama.cpp MMVQ kernel configs against real hardware (requires rocprofv3) |
+| `compare-backends <gguf>` | Head-to-head ROCm vs Vulkan decode comparison |
+
+Run `kernel-anvil <command> --help` for full options.
 
 ## Results
 
@@ -158,7 +201,7 @@ The profiling + sweep runs on any GPU that supports PyTorch + Triton. Hardware s
 ## Testing
 
 ```bash
-python -m pytest tests/ -v   # 193 tests
+python -m pytest tests/ -v
 ```
 
 ## Related Work

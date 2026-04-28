@@ -1,6 +1,7 @@
 """Tests for the GGUF parser module."""
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -8,7 +9,15 @@ import pytest
 
 from kernel_anvil.gguf import ModelProfile, TensorInfo, parse_gguf, print_model_summary
 
-QWEN3_PATH = Path.home() / "Models" / "Qwen3-8B-Q4_K_M.gguf"
+# Override with KERNEL_ANVIL_TEST_GGUF=/path/to/any.gguf to point the
+# integration tests at a different model. Tests skip cleanly when the
+# file is absent.
+QWEN3_PATH = Path(
+    os.environ.get(
+        "KERNEL_ANVIL_TEST_GGUF",
+        str(Path.home() / "Models" / "Qwen3-8B" / "Qwen3-8B-Q4_K_M.gguf"),
+    )
+)
 _skip_no_model = pytest.mark.skipif(
     not QWEN3_PATH.exists(), reason=f"GGUF file not found: {QWEN3_PATH}"
 )

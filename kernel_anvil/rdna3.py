@@ -172,7 +172,12 @@ def detect_gpu() -> GpuSpec | None:
             if "strix point" in name or "gfx1151" in name:
                 return GFX1151
             # RDNA 3
-            if "7900 xtx" in name or "gfx1100" in name or "radeon graphics" in name:
+            # Note: "radeon graphics" alone is too generic -- ROCm reports
+            # several iGPUs (Phoenix, Strix Point) with that exact string,
+            # which would mis-classify them as a 7900 XTX (96 CUs, 960 GB/s)
+            # and produce wildly wrong occupancy/bandwidth heuristics.
+            # Only match on the unambiguous identifiers.
+            if "7900 xtx" in name or "gfx1100" in name:
                 return GFX1100
             if "7900 xt" in name and "xtx" not in name:
                 return GFX1101
@@ -181,7 +186,7 @@ def detect_gpu() -> GpuSpec | None:
             # RDNA 2
             if "6900" in name or "6800 xt" in name or "gfx1030" in name:
                 return GFX1030
-            if "6800" in name and "xt" not in name or "gfx1031" in name:
+            if ("6800" in name and "xt" not in name) or "gfx1031" in name:
                 return GFX1031
             if "6700" in name or "6650" in name or "6600" in name or "gfx1032" in name:
                 return GFX1032

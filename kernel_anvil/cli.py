@@ -333,12 +333,103 @@ def _tune_shape_cli(
     return codegen_config, baseline_latency, speedup
 
 
+def _profile_gguf_shapes(
+    profile,
+    *,
+    no_bench: bool,
+    gpu_spec,
+    device,
+    args,
+    label: str,
+    codegen_configs: dict,
+    results_table: list,
+    speedups: dict[tuple[str, int, int], float],
+):
+    """Tune every unique shape in ``profile`` and accumulate into the shared
+    output dicts. Skips shapes already tuned by a previous model in the same
+    invocation (target+draft sharing).
+
+    On profiling failure for a shape, the slot is left ABSENT from
+    ``codegen_configs`` (recorded in ``results_table`` as a FAIL row) so a
+    subsequent draft model sharing that shape gets a fresh profiling
+    attempt instead of being silently locked into the failure config."""
+    shapes = profile.unique_shapes
+    label_prefix = f"[{label}] " if label else ""
+
+    if no_bench:
+        console.print(f"[bold]{label_prefix}Generating heuristic configs for {len(shapes)} shapes...[/bold]\n")
+        for i, ((qt, n, k), count) in enumerate(sorted(shapes.items()), 1):
+            if (qt, n, k) in codegen_configs:
+                console.print(f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: [dim]reused[/dim]")
+                continue
+            blocks_per_row = k // 256 if k >= 256 else 1
+            if blocks_per_row < 64:
+                cfg = {"nwarps": 2, "rows_per_block": 2}
+            else:
+                cfg = {"nwarps": 4, "rows_per_block": 1}
+            codegen_configs[(qt, n, k)] = cfg
+            console.print(f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: "
+                          f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} (heuristic)")
+            results_table.append((label, qt, n, k, count, cfg, 0, None, 0))
+        return
+
+    console.print(f"[bold]{label_prefix}Tuning {len(shapes)} unique GEMV workloads...[/bold]\n")
+    for i, ((qt, n, k), count) in enumerate(sorted(shapes.items()), 1):
+        if (qt, n, k) in codegen_configs:
+            console.print(f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: [dim]reused[/dim]")
+            continue
+        console.print(
+            f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}...",
+            end=" ",
+        )
+        t0 = time.monotonic()
+        try:
+            cfg, baseline_us, speedup = _tune_shape_cli(
+                N=n, K=k, device=device, gpu_spec=gpu_spec,
+                max_configs=args.max_configs, warmup=args.warmup, runs=args.runs,
+            )
+            dt = time.monotonic() - t0
+            speedup_str = f"{speedup:.2f}x" if speedup is not None else "-"
+            console.print(
+                f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} "
+                f"({speedup_str}, {dt:.1f}s)"
+            )
+            codegen_configs[(qt, n, k)] = cfg
+            if speedup is not None:
+                speedups[(qt, n, k)] = float(speedup)
+            results_table.append((label, qt, n, k, count, cfg, baseline_us, speedup, dt))
+        except Exception as e:
+            console.print(f"[red]FAILED: {e}[/red]")
+            # Don't poison the slot: leave (qt, n, k) absent from
+            # codegen_configs so a subsequent draft model with the same shape
+            # can still try profiling it. The results_table tracks the
+            # failure for the user-visible summary.
+            results_table.append((label, qt, n, k, count, None, 0, None, 0))
+
+
 def cmd_gguf_optimize(args):
-    """Parse GGUF, tune each unique shape, emit C header."""
+    """Parse GGUF (and optional draft GGUFs), tune each unique GEMV shape,
+    and write a runtime JSON config to ``~/.cache/smithy/<stem>.json``.
+
+    With ``--draft <gguf>`` (repeatable), profiles target and draft(s)
+    together and merges into a single config keyed under the target stem.
+    Bucket-cell collisions resolve to the higher profiled speedup so the
+    better-performing config survives.
+
+    A C header is also emitted when ``--output`` is explicitly set to a
+    non-default path."""
     gguf_path = Path(args.gguf)
     if not gguf_path.exists():
         console.print(f"[red]GGUF file not found: {gguf_path}[/red]")
         sys.exit(1)
+
+    draft_paths: list[Path] = []
+    for raw in getattr(args, "draft", None) or []:
+        dp = Path(raw)
+        if not dp.exists():
+            console.print(f"[red]Draft GGUF not found: {dp}[/red]")
+            sys.exit(1)
+        draft_paths.append(dp)
 
     # Check GPU (skip if --no-bench)
     no_bench = getattr(args, "no_bench", False)
@@ -358,76 +449,53 @@ def cmd_gguf_optimize(args):
         gpu_spec = _get_gpu_spec()
         device = torch.device("cuda")
 
-    # Parse GGUF
-    console.print(f"\n[bold]Parsing {gguf_path.name}...[/bold]")
-    profile = parse_gguf(str(gguf_path))
-
-    # Print model summary
+    # Parse target (and optional drafts)
+    console.print(f"\n[bold]Parsing target {gguf_path.name}...[/bold]")
+    target_profile = parse_gguf(str(gguf_path))
     console.print()
-    print_model_summary(profile)
+    print_model_summary(target_profile)
     console.print()
 
-    # Collect unique 2D shapes to tune
-    shapes = profile.unique_shapes
-    if not shapes:
-        console.print("[yellow]No 2D weight tensors found in model.[/yellow]")
+    draft_profiles = []
+    for dp in draft_paths:
+        console.print(f"\n[bold]Parsing draft {dp.name}...[/bold]")
+        dprof = parse_gguf(str(dp))
+        console.print()
+        print_model_summary(dprof)
+        console.print()
+        draft_profiles.append((dp, dprof))
+
+    if not target_profile.unique_shapes and not any(p.unique_shapes for _, p in draft_profiles):
+        console.print("[yellow]No 2D weight tensors found in any model.[/yellow]")
         sys.exit(0)
 
     codegen_configs: dict[tuple[str, int, int], dict] = {}
-    results_table = []
+    speedups: dict[tuple[str, int, int], float] = {}
+    results_table: list = []
     total_t0 = time.monotonic()
 
-    if no_bench:
-        # Heuristic mode: assign configs based on shape analysis, no GPU needed
-        console.print(f"[bold]Generating heuristic configs for {len(shapes)} shapes...[/bold]\n")
-        for i, ((qt, n, k), count) in enumerate(sorted(shapes.items()), 1):
-            blocks_per_row = k // 256 if k >= 256 else 1
-            # Heuristic: fewer warps for small K (less sync overhead)
-            if blocks_per_row < 64:  # small_k
-                cfg = {"nwarps": 2, "rows_per_block": 2}
-            else:
-                cfg = {"nwarps": 4, "rows_per_block": 1}
-            codegen_configs[(qt, n, k)] = cfg
-            console.print(f"  [{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: "
-                          f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} (heuristic)")
-            results_table.append((qt, n, k, count, cfg, 0, None, 0))
-    else:
-        console.print(f"[bold]Tuning {len(shapes)} unique GEMV workloads...[/bold]\n")
-
-        for i, ((qt, n, k), count) in enumerate(sorted(shapes.items()), 1):
-            console.print(
-                f"  [{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}...",
-                end=" ",
-            )
-            t0 = time.monotonic()
-            try:
-                cfg, baseline_us, speedup = _tune_shape_cli(
-                    N=n,
-                    K=k,
-                    device=device,
-                    gpu_spec=gpu_spec,
-                    max_configs=args.max_configs,
-                    warmup=args.warmup,
-                    runs=args.runs,
-                )
-                dt = time.monotonic() - t0
-                speedup_str = f"{speedup:.2f}x" if speedup is not None else "-"
-                console.print(
-                    f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} "
-                    f"({speedup_str}, {dt:.1f}s)"
-                )
-                codegen_configs[(qt, n, k)] = cfg
-                results_table.append((qt, n, k, count, cfg, baseline_us, speedup, dt))
-            except Exception as e:
-                console.print(f"[red]FAILED: {e}[/red]")
-                codegen_configs[(qt, n, k)] = {"nwarps": 4, "rows_per_block": 1}
-                results_table.append((qt, n, k, count, {"nwarps": 4, "rows_per_block": 1}, 0, None, 0))
+    _profile_gguf_shapes(
+        target_profile,
+        no_bench=no_bench, gpu_spec=gpu_spec, device=device, args=args,
+        label="target" if draft_profiles else "",
+        codegen_configs=codegen_configs, results_table=results_table, speedups=speedups,
+    )
+    for idx, (_, dprof) in enumerate(draft_profiles, start=1):
+        label = "draft" if len(draft_profiles) == 1 else f"draft{idx}"
+        _profile_gguf_shapes(
+            dprof,
+            no_bench=no_bench, gpu_spec=gpu_spec, device=device, args=args,
+            label=label,
+            codegen_configs=codegen_configs, results_table=results_table, speedups=speedups,
+        )
 
     total_dt = time.monotonic() - total_t0
 
     # Print results summary table
     console.print()
     table = Table(title="Optimization Results")
+    if draft_profiles:
+        table.add_column("Source", style="magenta")
     table.add_column("Quant", style="cyan")
     table.add_column("N", justify="right")
     table.add_column("K", justify="right")
@@ -438,21 +506,21 @@ def cmd_gguf_optimize(args):
     table.add_column("Speedup", justify="right")
     table.add_column("Time", justify="right", style="dim")
 
-    for qt, n, k, count, cfg, baseline_us, speedup, dt in results_table:
+    for label, qt, n, k, count, cfg, baseline_us, speedup, dt in results_table:
         speedup_str = f"[green]{speedup:.2f}x[/green]" if speedup is not None and speedup > 1.0 else (
             f"{speedup:.2f}x" if speedup is not None else "-"
         )
-        table.add_row(
-            qt,
-            str(n),
-            str(k),
-            str(count),
-            str(cfg["nwarps"]),
-            str(cfg["rows_per_block"]),
+        nwarps_str = str(cfg["nwarps"]) if cfg else "[red]FAIL[/red]"
+        rpb_str = str(cfg["rows_per_block"]) if cfg else "[red]FAIL[/red]"
+        row = [
+            qt, str(n), str(k), str(count),
+            nwarps_str, rpb_str,
             f"{baseline_us:.1f}" if baseline_us else "-",
-            speedup_str,
-            f"{dt:.1f}s",
-        )
+            speedup_str, f"{dt:.1f}s",
+        ]
+        if draft_profiles:
+            row.insert(0, label or "target")
+        table.add_row(*row)
 
     console.print(table)
     console.print(f"\nTotal tuning time: {total_dt:.1f}s")
@@ -460,10 +528,17 @@ def cmd_gguf_optimize(args):
     # Generate runtime JSON config for llama.cpp auto-loading
     from kernel_anvil.codegen import generate_runtime_config
 
+    if draft_profiles:
+        names = [target_profile.name] + [p.name for _, p in draft_profiles]
+        merged_model_name = "+".join(names)
+    else:
+        merged_model_name = target_profile.name
+
     json_config = generate_runtime_config(
         codegen_configs,
         gpu_name=gpu_spec.gfx,
-        model_name=profile.name,
+        model_name=merged_model_name,
+        priorities=speedups if draft_profiles else None,
     )
 
     # Write to ~/.cache/smithy/<model_basename>.json for auto-loading
@@ -479,22 +554,106 @@ def cmd_gguf_optimize(args):
         with os.fdopen(tmp_fd, "w") as f:
             f.write(json_config)
         os.rename(tmp_path, str(cache_path))
-    except Exception:
-        os.unlink(tmp_path)
-        raise
+    finally:
+        # Whether rename succeeded, raised OSError, or was aborted by an
+        # unrelated exception (KeyboardInterrupt, MemoryError, etc.), make
+        # sure we don't leak tempfiles in the cache dir.
+        if Path(tmp_path).exists():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     console.print(f"\n[bold green]Config cached to {cache_path}[/bold green]")
-    console.print(f"[dim]Run: SMITHY_MODEL={args.gguf} llama-server -m {args.gguf} -ngl 999[/dim]")
+    if draft_profiles:
+        # llama.cpp's llama-server only accepts ONE -md flag at runtime, so
+        # the hint emits a single draft. The merged config still covers any
+        # additional draft GGUFs the user passed via --draft, which is
+        # useful when iterating across draft candidates without re-tuning.
+        primary_draft = draft_profiles[0][0]
+        console.print(
+            f"[dim]Run: SMITHY_CONFIG={cache_path} llama-server "
+            f"-m {args.gguf} -md {primary_draft} -ngl 999[/dim]"
+        )
+        if len(draft_profiles) > 1:
+            extras = ", ".join(str(dp) for dp, _ in draft_profiles[1:])
+            console.print(
+                f"[dim]      (merged config also covers: {extras})[/dim]"
+            )
+    else:
+        console.print(
+            f"[dim]Run: SMITHY_MODEL={args.gguf} llama-server -m {args.gguf} -ngl 999[/dim]"
+        )
 
     # Also write C header if --output was explicitly set
     if args.output != "smithy-config.h":
         header = generate_config_header(
             codegen_configs,
             gpu_name=f"{gpu_spec.gfx} ({gpu_spec.name})",
-            model_name=profile.name,
+            model_name=merged_model_name,
         )
         output_path = Path(args.output)
         output_path.write_text(header)
         console.print(f"[dim]C header also written to {output_path}[/dim]")
+
+
+def cmd_merge_configs(args):
+    """Merge multiple kernel-anvil JSON configs into one.
+
+    Useful for speculative-decoding setups: profile each model separately
+    (target + draft) with ``gguf-optimize``, then point ``SMITHY_CONFIG`` at
+    the merged output. First-listed input wins on bucket-cell collisions.
+    """
+    import json
+    from kernel_anvil.codegen import merge_runtime_configs
+
+    payloads = []
+    for raw in args.inputs:
+        p = Path(raw)
+        if not p.exists():
+            console.print(f"[red]Config not found: {p}[/red]")
+            sys.exit(1)
+        try:
+            with open(p) as f:
+                payloads.append(json.load(f))
+        except json.JSONDecodeError as e:
+            console.print(f"[red]Invalid JSON in {p}: {e}[/red]")
+            sys.exit(1)
+
+    try:
+        merged = merge_runtime_configs(
+            payloads,
+            gpu_name=args.gpu,
+            model_name=args.model,
+        )
+    except (TypeError, ValueError, AttributeError) as e:
+        console.print(f"[red]Invalid config payload: {e}[/red]")
+        sys.exit(1)
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write: write to temp file in the same dir, then rename. Mirrors
+    # the cmd_gguf_optimize pattern; prevents truncated output if two
+    # merge-configs runs target the same path or the process is killed.
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(out_path.parent), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(json.dumps(merged, indent=2))
+        os.rename(tmp_path, str(out_path))
+    finally:
+        # Always clean up the tempfile if it's still there (covers OSError,
+        # KeyboardInterrupt, MemoryError, anything that aborted the rename).
+        if Path(tmp_path).exists():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    n_types = len(merged.get("configs") or {})
+    n_cells = sum(len(v) for v in (merged.get("configs") or {}).values())
+    console.print(f"[bold green]Merged {len(payloads)} configs -> {out_path}[/bold green]")
+    console.print(f"[dim]{n_types} quant types, {n_cells} bucket cells[/dim]")
+    console.print(f"[dim]Run: SMITHY_CONFIG={out_path} llama-server -m target.gguf -md draft.gguf -ngl 999[/dim]")
 
 
 def cmd_autoforge(args):
@@ -609,6 +768,23 @@ def main():
     p_gguf.add_argument("--warmup", type=int, default=3, help="Warmup iterations (default: 3)")
     p_gguf.add_argument("--runs", type=int, default=5, help="Timed iterations (default: 5)")
     p_gguf.add_argument("--no-bench", action="store_true", help="Skip GPU benchmarking, use heuristic configs (works without GPU)")
+    p_gguf.add_argument(
+        "--draft",
+        action="append",
+        metavar="GGUF",
+        help="Optional draft model GGUF (for speculative decoding). May be passed multiple times. "
+             "Profiles target + draft together and writes a single merged config keyed under the target stem.",
+    )
+
+    # merge-configs: combine multiple cached JSON configs into one
+    p_merge = sub.add_parser(
+        "merge-configs",
+        help="Merge multiple kernel-anvil JSON configs into one (e.g. for speculative decoding)",
+    )
+    p_merge.add_argument("inputs", nargs="+", help="Input config JSON files (priority = argument order)")
+    p_merge.add_argument("-o", "--output", required=True, help="Output merged config path")
+    p_merge.add_argument("--gpu", help="Override gpu field in merged output")
+    p_merge.add_argument("--model", help="Override model field in merged output")
 
     # autoforge: generate, compile, benchmark shape-specific kernels
     p_forge = sub.add_parser("autoforge", help="Auto-generate optimized HIP kernels for a model")
@@ -647,6 +823,8 @@ def main():
         cmd_autoforge(args)
     elif args.command == "compare-backends":
         cmd_compare(args)
+    elif args.command == "merge-configs":
+        cmd_merge_configs(args)
 
 
 if __name__ == "__main__":
