@@ -1,5 +1,6 @@
 """Tests for the smithy gguf-optimize CLI command."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,7 +12,14 @@ import torch
 from kernel_anvil.cli import main, _make_runner, _tune_shape_cli
 
 PROJ_ROOT = Path(__file__).parent.parent
-QWEN3_PATH = Path.home() / "Models" / "Qwen3-8B-Q4_K_M.gguf"
+# Override with KERNEL_ANVIL_TEST_GGUF=/path/to/any.gguf to point the
+# integration tests at a different model. Tests skip cleanly when absent.
+QWEN3_PATH = Path(
+    os.environ.get(
+        "KERNEL_ANVIL_TEST_GGUF",
+        str(Path.home() / "Models" / "Qwen3-8B" / "Qwen3-8B-Q4_K_M.gguf"),
+    )
+)
 HAS_GPU = torch.cuda.is_available()
 
 _skip_no_gpu = pytest.mark.skipif(not HAS_GPU, reason="No GPU available")
