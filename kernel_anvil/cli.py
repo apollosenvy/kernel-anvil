@@ -1,8 +1,10 @@
 """CLI for kernel-anvil -- profile-guided Triton kernel optimizer."""
 import argparse
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -716,6 +718,398 @@ def cmd_llama_sweep(args):
     console.print(f"\n[dim]Run llama.cpp with: SMITHY_CONFIG={path} llama-server -m {args.gguf} -ngl 999[/dim]")
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write text to ``path`` via a tempfile + os.rename.
+
+    Mirrors the cmd_gguf_optimize pattern so train-optimize gets the same
+    crash-safety guarantees (no truncated JSON on Ctrl-C, no leftover
+    `.json.tmp` files in the cache dir).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(text)
+        os.rename(tmp_path, str(path))
+    finally:
+        if Path(tmp_path).exists():
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _resolve_train_runner(op: str, mud_puppy_path: str | None):
+    """Look up a mud-puppy training runner module for the given op.
+
+    The runner contract lives in `mud_puppy.anvil_runner.<op>_runner` (e.g.
+    `mxfp4_fwd_runner`). When ``mud_puppy_path`` is provided we prepend it
+    to sys.path so the import resolves against a checkout that isn't
+    pip-installed.
+
+    Returns the module object on success, None when the runner is not
+    importable. Caller decides whether to skip (dry-run) or hard-fail.
+    """
+    if mud_puppy_path:
+        mp_path = str(Path(mud_puppy_path).resolve())
+        if mp_path not in sys.path:
+            sys.path.insert(0, mp_path)
+    try:
+        import importlib
+
+        module_name = f"mud_puppy.anvil_runner.{op}_runner"
+        return importlib.import_module(module_name)
+    except Exception:
+        return None
+
+
+def _train_dry_run_config(M: int, N: int, K: int) -> dict:
+    """Synthetic 'best config' used when no GPU/runner is available.
+
+    The default mirrors the empirical winner from the headroom benchmark
+    (BLOCK_M=128, BLOCK_N=64, BLOCK_K=32, GROUP_M=8, num_warps=8,
+    num_stages=4) so dry-run JSON skeletons are immediately useful as a
+    starting point if a real sweep can't be done."""
+    return {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "BLOCK_K": 32,
+        "GROUP_M": 8,
+        "num_warps": 8,
+        "num_stages": 4,
+        "speedup_vs_baseline": 1.0,
+        "profiled_us": 0.0,
+    }
+
+
+def _tune_train_shape(
+    *,
+    runner_module,
+    op: str,
+    M: int,
+    N: int,
+    K: int,
+    gpu_spec,
+    max_configs: int,
+    warmup: int,
+    runs: int,
+) -> tuple[dict, float, float | None]:
+    """Sweep a single (op, M, N, K) shape via a mud-puppy runner module.
+
+    The runner is expected to expose:
+        - `make_inputs(M, N, K) -> inputs` (preferred) OR `setup() -> inputs`
+        - `reference(inputs) -> tensor or tuple`
+        - `run(inputs, **config) -> tensor or tuple`
+        - optional `BASELINE_CONFIG` and `DATA_BYTES`
+        - optional `OUTPUT_INDEX` for which slot to allclose-check (default 0)
+
+    Returns ``(best_payload, baseline_us, speedup_or_None)`` where
+    `best_payload` is a dict suitable for `train_codegen.generate_train_runtime_config`.
+    """
+    from kernel_anvil.train_param_space import generate_train_configs
+
+    # Build inputs. Prefer make_inputs(M, N, K) if exposed; fall back to
+    # setup() with no args (legacy contract).
+    if hasattr(runner_module, "make_inputs"):
+        inputs = runner_module.make_inputs(M, N, K)
+    else:
+        inputs = runner_module.setup()
+
+    ref = runner_module.reference(inputs)
+    output_index = int(getattr(runner_module, "OUTPUT_INDEX", 0))
+    baseline_config = dict(getattr(runner_module, "BASELINE_CONFIG", {}) or {})
+    data_bytes = getattr(runner_module, "DATA_BYTES", None)
+
+    def kernel_fn(cfg):
+        return runner_module.run(inputs, **cfg)
+
+    # Baseline benchmark (if BASELINE_CONFIG present, otherwise skip).
+    baseline_latency = None
+    if baseline_config:
+        try:
+            baseline_result = verify_and_bench(
+                kernel_fn=kernel_fn,
+                reference_output=ref,
+                config=baseline_config,
+                warmup=warmup,
+                runs=runs,
+                data_bytes=data_bytes,
+                output_index=output_index,
+            )
+            baseline_latency = baseline_result.latency_us
+        except Exception:
+            baseline_latency = None
+
+    # Generate candidate configs and benchmark each.
+    candidates = generate_train_configs(gpu=gpu_spec, max_configs=max_configs)
+    best_cfg = baseline_config or candidates[0] if candidates else baseline_config
+    best_latency = baseline_latency if baseline_latency is not None else float("inf")
+
+    for cfg in candidates:
+        try:
+            result = verify_and_bench(
+                kernel_fn=kernel_fn,
+                reference_output=ref,
+                config=cfg,
+                warmup=warmup,
+                runs=runs,
+                data_bytes=data_bytes,
+                baseline_latency_us=baseline_latency,
+                atol=1e-2,
+                rtol=1e-2,
+                output_index=output_index,
+            )
+            if result.correct and result.latency_us < best_latency:
+                best_latency = result.latency_us
+                best_cfg = cfg
+        except Exception:
+            continue
+
+    if best_cfg is None:
+        # Everything failed -- emit a dry-run payload so the JSON layer
+        # still has a sensible default for this cell.
+        return _train_dry_run_config(M, N, K), baseline_latency or 0.0, None
+
+    speedup = None
+    if baseline_latency is not None and best_latency > 0:
+        speedup = baseline_latency / best_latency
+
+    payload = {
+        "BLOCK_M": int(best_cfg.get("BLOCK_M", 128)),
+        "BLOCK_N": int(best_cfg.get("BLOCK_N", 64)),
+        "BLOCK_K": int(best_cfg.get("BLOCK_K", 32)),
+        "GROUP_M": int(best_cfg.get("GROUP_M", 8)),
+        "num_warps": int(best_cfg.get("num_warps", 8)),
+        "num_stages": int(best_cfg.get("num_stages", 4)),
+    }
+    if speedup is not None:
+        payload["speedup_vs_baseline"] = float(speedup)
+    if best_latency != float("inf"):
+        payload["profiled_us"] = float(best_latency)
+    return payload, float(baseline_latency or 0.0), speedup
+
+
+def cmd_train_optimize(args):
+    """Profile training-time GEMM shapes for a model and emit anvil-train JSON.
+
+    The training-side counterpart of `cmd_gguf_optimize`. Walks the HF
+    model config, enumerates the unique (op, M, N, K) shapes for the given
+    (batch, seq), runs a sweep against the mud-puppy runner for each, and
+    writes a v1 JSON to `~/.cache/anvil-train/<gpu>/<model>-<quant>-bN-sM.json`.
+
+    When mud-puppy isn't importable (no ``--mud-puppy-path`` and no
+    installed package), falls back to a dry-run mode that emits a JSON
+    skeleton with placeholder configs -- useful for testing the JSON layer
+    on a CPU-only box.
+    """
+    from kernel_anvil.train_codegen import generate_train_runtime_config
+    from kernel_anvil.train_shapes import extract_shapes, model_basename
+
+    # Resolve quant -> ops mapping
+    quant = args.quant
+    if quant not in ("mxfp4", "int4"):
+        console.print(f"[red]Unknown quant: {quant} (expected mxfp4 or int4)[/red]")
+        sys.exit(1)
+
+    if args.ops:
+        ops = [s.strip() for s in args.ops.split(",") if s.strip()]
+    else:
+        ops = [f"{quant}_fwd", f"{quant}_grad_input"]
+
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    # Detect GPU for cache-path stamping (always succeeds; falls back to GFX1100).
+    if dry_run:
+        gpu_spec = GFX1100
+        device = None
+        console.print("[yellow]--dry-run: emitting JSON skeleton, no GPU benchmarking[/yellow]")
+    else:
+        if not torch.cuda.is_available():
+            console.print(
+                "[yellow]GPU not detected -- falling back to --dry-run mode."
+                " Install a ROCm PyTorch build to benchmark training kernels.[/yellow]"
+            )
+            dry_run = True
+            gpu_spec = GFX1100
+            device = None
+        else:
+            gpu_spec = _get_gpu_spec()
+            device = torch.device("cuda")
+
+    # Pull shapes
+    console.print(f"\n[bold]Extracting training shapes for {args.model}...[/bold]")
+    try:
+        shapes = extract_shapes(args.model, batch=args.batch, seq=args.seq, ops=ops)
+    except Exception as exc:
+        console.print(f"[red]Failed to extract shapes: {exc}[/red]")
+        sys.exit(1)
+
+    if not shapes:
+        console.print("[yellow]No shapes extracted -- nothing to do.[/yellow]")
+        sys.exit(0)
+
+    console.print(f"[dim]{len(shapes)} unique (op, M, N, K) tuples[/dim]")
+
+    # Resolve runners (one per op family)
+    runners: dict[str, object] = {}
+    if not dry_run:
+        for op in ops:
+            mod = _resolve_train_runner(op, args.mud_puppy_path)
+            if mod is None:
+                console.print(
+                    f"[yellow]Runner for {op!r} not available (no mud-puppy on path);"
+                    f" falling back to dry-run for this op.[/yellow]"
+                )
+            runners[op] = mod
+        if all(r is None for r in runners.values()):
+            console.print(
+                "[yellow]No runners resolved -- switching entire run to --dry-run mode.[/yellow]"
+            )
+            dry_run = True
+
+    # Sweep loop
+    configs: dict[tuple[str, int, int, int], dict] = {}
+    speedups: dict[tuple[str, int, int, int], float] = {}
+    results_table_rows: list = []
+    total_t0 = time.monotonic()
+
+    for i, (op, M, N, K) in enumerate(shapes, 1):
+        runner = runners.get(op) if not dry_run else None
+        t0 = time.monotonic()
+        if runner is None or dry_run:
+            payload = _train_dry_run_config(M, N, K)
+            speedup = None
+            baseline_us = 0.0
+        else:
+            try:
+                payload, baseline_us, speedup = _tune_train_shape(
+                    runner_module=runner,
+                    op=op,
+                    M=M,
+                    N=N,
+                    K=K,
+                    gpu_spec=gpu_spec,
+                    max_configs=args.max_configs,
+                    warmup=args.warmup,
+                    runs=args.runs,
+                )
+            except Exception as exc:
+                console.print(f"  [{i}/{len(shapes)}] {op} ({M},{N},{K}): [red]FAILED[/red] {exc}")
+                payload = _train_dry_run_config(M, N, K)
+                speedup = None
+                baseline_us = 0.0
+        configs[(op, M, N, K)] = payload
+        if speedup is not None:
+            speedups[(op, M, N, K)] = float(speedup)
+        dt = time.monotonic() - t0
+        results_table_rows.append((op, M, N, K, payload, baseline_us, speedup, dt))
+        if speedup is not None:
+            console.print(
+                f"  [{i}/{len(shapes)}] {op} ({M},{N},{K}): "
+                f"BLOCK_M={payload['BLOCK_M']} BLOCK_N={payload['BLOCK_N']} "
+                f"BLOCK_K={payload['BLOCK_K']} ({speedup:.2f}x, {dt:.1f}s)"
+            )
+        else:
+            tag = "dry-run" if dry_run or runner is None else "no-baseline"
+            console.print(
+                f"  [{i}/{len(shapes)}] {op} ({M},{N},{K}): "
+                f"BLOCK_M={payload['BLOCK_M']} BLOCK_N={payload['BLOCK_N']} "
+                f"BLOCK_K={payload['BLOCK_K']} ({tag})"
+            )
+
+    total_dt = time.monotonic() - total_t0
+
+    # Print summary table
+    table = Table(title="Train-Optimize Results")
+    table.add_column("Op", style="cyan")
+    table.add_column("M", justify="right")
+    table.add_column("N", justify="right")
+    table.add_column("K", justify="right")
+    table.add_column("BLOCK_M/N/K", justify="right")
+    table.add_column("warps", justify="right")
+    table.add_column("stages", justify="right")
+    table.add_column("Baseline (us)", justify="right")
+    table.add_column("Speedup", justify="right")
+    table.add_column("Time", justify="right", style="dim")
+
+    for op, M, N, K, payload, baseline_us, speedup, dt in results_table_rows:
+        speedup_str = (
+            f"[green]{speedup:.2f}x[/green]" if speedup is not None and speedup > 1.0
+            else (f"{speedup:.2f}x" if speedup is not None else "-")
+        )
+        tile_str = f"{payload['BLOCK_M']}/{payload['BLOCK_N']}/{payload['BLOCK_K']}"
+        table.add_row(
+            op, str(M), str(N), str(K),
+            tile_str,
+            str(payload["num_warps"]),
+            str(payload["num_stages"]),
+            f"{baseline_us:.1f}" if baseline_us else "-",
+            speedup_str,
+            f"{dt:.1f}s",
+        )
+
+    console.print()
+    console.print(table)
+    console.print(f"\nTotal tuning time: {total_dt:.1f}s")
+
+    # Build the JSON payload
+    model_id = args.model
+    basename = model_basename(model_id)
+    rocm_version = _detect_rocm_version()
+    torch_version = getattr(torch, "__version__", "")
+    triton_version = _detect_triton_version()
+
+    json_text = generate_train_runtime_config(
+        configs,
+        gpu=gpu_spec.gfx,
+        model=basename,
+        batch=args.batch,
+        seq=args.seq,
+        rocm_version=rocm_version,
+        torch_version=torch_version,
+        triton_version=triton_version,
+        kernel_hash="",  # populated by mud-puppy on the loader side
+        priorities={k: int(v * 1000) for k, v in speedups.items()} or None,
+    )
+
+    # Resolve output path
+    if args.output:
+        out_path = Path(args.output).expanduser().resolve()
+    else:
+        out_path = (
+            Path.home() / ".cache" / "anvil-train" / gpu_spec.gfx
+            / f"{basename}-{quant}-b{args.batch}s{args.seq}.json"
+        )
+    _atomic_write_text(out_path, json_text)
+
+    console.print(f"\n[bold green]anvil-train config written to {out_path}[/bold green]")
+    if dry_run:
+        console.print(
+            "[dim]Dry-run JSON. Re-run with mud-puppy on the path and a GPU"
+            " to populate real configs.[/dim]"
+        )
+
+
+def _detect_rocm_version() -> str:
+    """Best-effort ROCm version string. Empty when unavailable."""
+    try:
+        info_file = Path("/opt/rocm/.info/version")
+        if info_file.exists():
+            return info_file.read_text().strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _detect_triton_version() -> str:
+    try:
+        import triton  # type: ignore
+
+        return getattr(triton, "__version__", "")
+    except Exception:
+        return ""
+
+
 def cmd_compare(args):
     """Compare ROCm vs Vulkan backend performance."""
     from kernel_anvil.vulkan_sweep import compare_backends
@@ -800,6 +1194,55 @@ def main():
     p_llama.add_argument("--llama-bench", help="Path to llama-bench binary")
     p_llama.add_argument("--nwarps", default="1,2,4,8", help="Comma-separated nwarps to try (default: 1,2,4,8)")
 
+    # train-optimize: profile training-side GEMM shapes for mud-puppy
+    p_train = sub.add_parser(
+        "train-optimize",
+        help="Tune training-time GEMM kernels (mxfp4/int4 fwd + grad-input)"
+             " against an HF model + (batch, seq) shape -- emits anvil-train v1 JSON.",
+    )
+    p_train.add_argument("model", help="HF model id (e.g. Qwen/Qwen3-8B) or local path")
+    p_train.add_argument(
+        "--quant",
+        choices=("mxfp4", "int4"),
+        required=True,
+        help="Quantization scheme to tune (selects op set unless --ops is given)",
+    )
+    p_train.add_argument("--batch", type=int, required=True, help="Per-device batch size")
+    p_train.add_argument("--seq", type=int, required=True, help="Training sequence length")
+    p_train.add_argument(
+        "--ops",
+        default="",
+        help="Comma-separated op list. Default: <quant>_fwd,<quant>_grad_input",
+    )
+    p_train.add_argument(
+        "--mud-puppy-path",
+        default=None,
+        help="Path to a mud-puppy checkout (prepended to sys.path so"
+             " mud_puppy.anvil_runner.<op>_runner imports resolve).",
+    )
+    p_train.add_argument(
+        "--output",
+        default=None,
+        help="Output JSON path. Default: ~/.cache/anvil-train/<gpu>/<model>-<quant>-b<B>s<S>.json",
+    )
+    p_train.add_argument(
+        "--max-configs", type=int, default=30,
+        help="Cap on Triton configs per shape (default: 30).",
+    )
+    p_train.add_argument(
+        "--warmup", type=int, default=3,
+        help="Warmup iterations per benchmark (default: 3).",
+    )
+    p_train.add_argument(
+        "--runs", type=int, default=5,
+        help="Timed iterations per benchmark (default: 5).",
+    )
+    p_train.add_argument(
+        "--dry-run", action="store_true",
+        help="Skip GPU benchmarking; emit a JSON skeleton with placeholder"
+             " configs. Useful for testing the JSON layer without a GPU.",
+    )
+
     # compare: head-to-head ROCm vs Vulkan
     p_compare = sub.add_parser("compare-backends", help="Compare ROCm vs Vulkan decode performance")
     p_compare.add_argument("gguf", help="Path to GGUF model file")
@@ -825,6 +1268,8 @@ def main():
         cmd_compare(args)
     elif args.command == "merge-configs":
         cmd_merge_configs(args)
+    elif args.command == "train-optimize":
+        cmd_train_optimize(args)
 
 
 if __name__ == "__main__":

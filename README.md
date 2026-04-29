@@ -90,6 +90,22 @@ kernel-anvil sweep examples/simple_gemv.py
 kernel-anvil profile examples/simple_gemv.py
 ```
 
+### Tune training-time kernels (mud-puppy)
+
+`train-optimize` is the training-side counterpart of `gguf-optimize`. Given a Hugging Face model id and a `(batch, seq)` pair, it walks the HF config, enumerates the unique `(op, M, N, K)` GEMM shapes the forward and grad-input kernels will see during fine-tuning, sweeps Triton configs against [mud-puppy](https://github.com/apollosenvy/mud-puppy)'s training kernels, and writes an `anvil-train/v1` JSON to `~/.cache/anvil-train/<gpu>/<model>-<quant>-b<B>s<S>.json`. mud-puppy's `anvil_loader` reads the cache at startup to pick per-shape configs.
+
+```bash
+kernel-anvil train-optimize Qwen/Qwen3-8B \
+    --quant mxfp4 --batch 1 --seq 4096 \
+    --mud-puppy-path /path/to/mud-puppy
+
+# Dry-run (no GPU): emit a JSON skeleton with placeholder configs.
+kernel-anvil train-optimize Qwen/Qwen3-8B \
+    --quant int4 --batch 1 --seq 4096 --dry-run
+```
+
+Supported architectures: `LlamaConfig`, `Qwen3Config`, `GptOssConfig` (MoE -- per-expert irregular-M shapes are bucketed). Default ops: `mxfp4_fwd`, `mxfp4_grad_input`, `int4_fwd`, `int4_grad_input`.
+
 ### Other commands
 
 | Command | Purpose |
