@@ -543,28 +543,11 @@ def cmd_gguf_optimize(args):
         priorities=speedups if draft_profiles else None,
     )
 
-    # Write to ~/.cache/smithy/<model_basename>.json for auto-loading
-    # Must be ~/.cache/smithy/ to match llama.cpp's smithy-config.h lookup path
+    # Write to ~/.cache/smithy/<model_basename>.json for auto-loading.
+    # Must be ~/.cache/smithy/ to match llama.cpp's smithy-config.h lookup path.
     model_basename = Path(args.gguf).stem  # e.g., "Qwen3-8B-Q4_K_M"
-    cache_dir = Path.home() / ".cache" / "smithy"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{model_basename}.json"
-    # Atomic write: write to temp file, then rename
-    import tempfile
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(cache_dir), suffix=".json.tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write(json_config)
-        os.rename(tmp_path, str(cache_path))
-    finally:
-        # Whether rename succeeded, raised OSError, or was aborted by an
-        # unrelated exception (KeyboardInterrupt, MemoryError, etc.), make
-        # sure we don't leak tempfiles in the cache dir.
-        if Path(tmp_path).exists():
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    cache_path = Path.home() / ".cache" / "smithy" / f"{model_basename}.json"
+    _atomic_write_text(cache_path, json_config)
     console.print(f"\n[bold green]Config cached to {cache_path}[/bold green]")
     if draft_profiles:
         # llama.cpp's llama-server only accepts ONE -md flag at runtime, so
@@ -605,7 +588,6 @@ def cmd_merge_configs(args):
     (target + draft) with ``gguf-optimize``, then point ``SMITHY_CONFIG`` at
     the merged output. First-listed input wins on bucket-cell collisions.
     """
-    import json
     from kernel_anvil.codegen import merge_runtime_configs
 
     payloads = []
@@ -632,24 +614,7 @@ def cmd_merge_configs(args):
         sys.exit(1)
 
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: write to temp file in the same dir, then rename. Mirrors
-    # the cmd_gguf_optimize pattern; prevents truncated output if two
-    # merge-configs runs target the same path or the process is killed.
-    import tempfile
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(out_path.parent), suffix=".json.tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write(json.dumps(merged, indent=2))
-        os.rename(tmp_path, str(out_path))
-    finally:
-        # Always clean up the tempfile if it's still there (covers OSError,
-        # KeyboardInterrupt, MemoryError, anything that aborted the rename).
-        if Path(tmp_path).exists():
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    _atomic_write_text(out_path, json.dumps(merged, indent=2))
 
     n_types = len(merged.get("configs") or {})
     n_cells = sum(len(v) for v in (merged.get("configs") or {}).values())
@@ -721,9 +686,10 @@ def cmd_llama_sweep(args):
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write text to ``path`` via a tempfile + os.rename.
 
-    Mirrors the cmd_gguf_optimize pattern so train-optimize gets the same
-    crash-safety guarantees (no truncated JSON on Ctrl-C, no leftover
-    `.json.tmp` files in the cache dir).
+    Crash-safe: no truncated output if the process is killed mid-write,
+    no leftover ``.json.tmp`` files even on KeyboardInterrupt / MemoryError /
+    OSError (the ``finally`` always cleans up if ``rename`` didn't fire).
+    Used by every cmd that writes a config JSON to disk.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
