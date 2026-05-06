@@ -32,6 +32,12 @@ def _load_runner(path: str):
         console.print(f"[red]Runner not found: {p}[/red]")
         sys.exit(1)
     spec = importlib.util.spec_from_file_location("runner", p)
+    if spec is None or spec.loader is None:
+        # spec_from_file_location returns None for non-Python files (no
+        # importer match). loader can also be None for namespace packages.
+        # Surface a clear error instead of crashing with AttributeError.
+        console.print(f"[red]Runner file is not importable as Python: {p}[/red]")
+        sys.exit(1)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -591,16 +597,34 @@ def cmd_merge_configs(args):
     from kernel_anvil.codegen import merge_runtime_configs
 
     payloads = []
+    # Cap each input config at 32 MiB. A real kernel-anvil config is a few
+    # KB; a 32 MiB ceiling is generous enough that legitimate files always
+    # fit but stops a malformed/adversarial JSON from exhausting memory.
+    MAX_CONFIG_BYTES = 32 * 1024 * 1024
     for raw in args.inputs:
         p = Path(raw)
         if not p.exists():
             console.print(f"[red]Config not found: {p}[/red]")
             sys.exit(1)
         try:
+            size = p.stat().st_size
+        except OSError as e:
+            console.print(f"[red]Cannot stat {p}: {e}[/red]")
+            sys.exit(1)
+        if size > MAX_CONFIG_BYTES:
+            console.print(
+                f"[red]Config {p} is {size} bytes, exceeds the {MAX_CONFIG_BYTES}-byte"
+                f" sanity cap. Refusing to load.[/red]"
+            )
+            sys.exit(1)
+        try:
             with open(p) as f:
                 payloads.append(json.load(f))
         except json.JSONDecodeError as e:
             console.print(f"[red]Invalid JSON in {p}: {e}[/red]")
+            sys.exit(1)
+        except OSError as e:
+            console.print(f"[red]Cannot read {p}: {e}[/red]")
             sys.exit(1)
 
     try:
@@ -808,7 +832,15 @@ def _tune_train_shape(
 
     # Generate candidate configs and benchmark each.
     candidates = generate_train_configs(gpu=gpu_spec, max_configs=max_configs)
-    best_cfg = baseline_config or candidates[0] if candidates else baseline_config
+    # Pick a sane initial best_cfg without falling into Python operator
+    # precedence traps. `a or b if c else d` parses as `a or (b if c else d)`,
+    # which silently swaps the priority when baseline_config is empty.
+    if baseline_config:
+        best_cfg = baseline_config
+    elif candidates:
+        best_cfg = candidates[0]
+    else:
+        best_cfg = baseline_config  # may be {}; later code handles None/empty
     best_latency = baseline_latency if baseline_latency is not None else float("inf")
 
     for cfg in candidates:

@@ -270,17 +270,24 @@ def sweep_model(
     # Run baseline (no smithy config)
     if verbose:
         print(f"\nBaseline (stock llama.cpp)...")
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        # Empty config = no overrides
-        f.write('{"configs": {}}')
-        empty_config = f.name
-
+    # Wrap NamedTemporaryFile creation inside the try so a SIGINT/OSError
+    # between NamedTemporaryFile() and the bench call cannot leak the
+    # tempfile in /tmp.
+    empty_config: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            # Empty config = no overrides
+            f.write('{"configs": {}}')
+            empty_config = f.name
         baseline_tps, baseline_timings = _run_bench_with_config(
             llama_bench, model_path, empty_config,
         )
     finally:
-        os.unlink(empty_config)
+        if empty_config is not None and os.path.exists(empty_config):
+            try:
+                os.unlink(empty_config)
+            except OSError:
+                pass
 
     if verbose:
         print(f"  Baseline: {baseline_tps:.2f} tok/s")
@@ -293,20 +300,25 @@ def sweep_model(
             print(f"  Sweeping nwarps={nw}...", end=" ", flush=True)
 
         config_json = _gen_config(nw, shapes)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            f.write(config_json)
-            config_path = f.name
-
+        config_path: str | None = None
         try:
-            tps, timings = _run_bench_with_config(llama_bench, model_path, config_path)
-            results_by_nwarps[nw] = (tps, timings)
-            if verbose:
-                print(f"{tps:.2f} tok/s")
-        except Exception as e:
-            if verbose:
-                print(f"FAILED: {e}")
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                f.write(config_json)
+                config_path = f.name
+            try:
+                tps, timings = _run_bench_with_config(llama_bench, model_path, config_path)
+                results_by_nwarps[nw] = (tps, timings)
+                if verbose:
+                    print(f"{tps:.2f} tok/s")
+            except Exception as e:
+                if verbose:
+                    print(f"FAILED: {e}")
         finally:
-            os.unlink(config_path)
+            if config_path is not None and os.path.exists(config_path):
+                try:
+                    os.unlink(config_path)
+                except OSError:
+                    pass
 
     # Find the best global nwarps (simple approach)
     if not results_by_nwarps:
@@ -364,8 +376,14 @@ def write_optimal_config(result: SweepResult, cache_dir: str | None = None):
         with os.fdopen(fd, "w") as f:
             json.dump(config, f, indent=2)
         os.rename(tmp, path)
-    except Exception:
-        os.unlink(tmp)
-        raise
+    finally:
+        # finally (not except) so KeyboardInterrupt / MemoryError between
+        # mkstemp and the write also clean up. After a successful rename,
+        # tmp no longer exists -- guard with os.path.exists.
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     return path

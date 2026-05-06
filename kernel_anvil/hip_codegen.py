@@ -603,11 +603,16 @@ def compile_kernel(
     Returns:
         Path to the compiled .so file.
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".hip", delete=False) as f:
-        f.write(hip_source)
-        src_path = f.name
-
+    # Create the source file inside a try/finally so a SIGINT or OSError
+    # between NamedTemporaryFile() and the compile call never leaks the
+    # tempfile. Previously: a KeyboardInterrupt in that window left a
+    # ".hip" file behind in /tmp.
+    src_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".hip", delete=False) as f:
+            f.write(hip_source)
+            src_path = f.name
+
         cmd = [
             "hipcc",
             "--offload-arch=" + arch,
@@ -643,7 +648,14 @@ def compile_kernel(
             raise RuntimeError(f"hipcc failed:\n{result.stderr}")
         return output_path
     finally:
-        os.unlink(src_path)
+        # src_path is None only if NamedTemporaryFile itself failed; nothing
+        # to clean up in that case. Wrap unlink in try/except so a racy
+        # deletion (e.g., disk wiped) doesn't mask the original exception.
+        if src_path is not None and os.path.exists(src_path):
+            try:
+                os.unlink(src_path)
+            except OSError:
+                pass
 
 
 def _heuristic_config(quant_info: QuantTypeInfo, n: int, k: int) -> tuple[int, int]:

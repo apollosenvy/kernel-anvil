@@ -245,10 +245,24 @@ def model_basename(model_id: str) -> str:
     """Best-effort model basename for cache-path construction.
 
     `Qwen/Qwen3-8B` -> `Qwen3-8B`. Local paths use the directory stem.
+
+    Strips path separators and ``..`` / ``.`` segments so the result is
+    always safe to interpolate into a cache path. Defensive: callers
+    historically composed `~/.cache/anvil-train/<gpu>/<basename>-...`
+    without an extra sanitization pass.
     """
     if not model_id:
         return "model"
-    s = str(model_id).rstrip("/")
+    s = str(model_id).rstrip("/").rstrip("\\")
     if "/" in s:
-        return s.split("/")[-1]
-    return s
+        s = s.split("/")[-1]
+    if "\\" in s:
+        s = s.split("\\")[-1]
+    # Refuse pure-traversal segments outright.
+    if s in ("", ".", ".."):
+        return "model"
+    # Remove embedded NUL / control chars that could confuse downstream
+    # filesystem code, and reject any leftover separators (defense in
+    # depth -- the splits above already handle the common cases).
+    s = s.replace("\x00", "").replace("/", "_").replace("\\", "_")
+    return s or "model"

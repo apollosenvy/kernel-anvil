@@ -386,9 +386,16 @@ def autoforge(
         with os.fdopen(fd, "w") as f:
             json.dump(config, f, indent=2)
         os.rename(tmp, config_path)
-    except Exception:
-        os.unlink(tmp)
-        raise
+    finally:
+        # finally (not except) so KeyboardInterrupt / MemoryError between
+        # mkstemp and the write also clean up. After a successful rename,
+        # the tmp path no longer exists -- the os.path.exists guard skips
+        # the unlink and the inner OSError catch absorbs racy disappearance.
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     elapsed = time.monotonic() - t0
 

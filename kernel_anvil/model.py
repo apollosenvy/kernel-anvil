@@ -9,6 +9,7 @@ Usage:
 import hashlib
 import json
 import os
+import tempfile
 import time
 
 import torch
@@ -133,17 +134,44 @@ def _cache_path(model: nn.Module, cache_dir: str | None) -> str:
 
 
 def _save_configs(path: str, configs: dict):
-    """Save shape->config mapping to JSON."""
-    with open(path, "w") as f:
-        json.dump(configs, f, indent=2)
+    """Save shape->config mapping to JSON.
+
+    Atomic via tempfile + rename. A SIGKILL or power-loss mid-write leaves
+    the previous cache file intact instead of producing a half-written JSON
+    that crashes on the next load.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(configs, f, indent=2)
+        os.rename(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _load_configs(path: str) -> dict | None:
-    """Load cached shape->config mapping, or None if absent."""
-    if os.path.exists(path):
+    """Load cached shape->config mapping, or None if absent / unreadable.
+
+    Returns None on any of: missing file, unreadable file, malformed JSON,
+    or non-dict top-level payload. The caller treats None as "no cache" and
+    tunes from scratch -- safer than crashing on a corrupted cache.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
         with open(path) as f:
-            return json.load(f)
-    return None
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 # ---------------------------------------------------------------------------
