@@ -1130,6 +1130,41 @@ def cmd_compare(args):
             console.print(f"\n[bold green]ROCm recommended for this workload.[/bold green]")
 
 
+
+
+def cmd_ablate(args):
+    """Ground-truth per-cell ablation against the real model + kernel."""
+    from pathlib import Path as _Path
+
+    from kernel_anvil.cell_ablation import run_ablation
+    from kernel_anvil.gguf import parse_gguf
+
+    profile = parse_gguf(args.gguf)
+    out = args.out
+    if out is None:
+        stem = _Path(args.gguf).stem
+        out = _Path.home() / ".cache" / "smithy" / f"{stem}.json"
+    extra = args.bench_args.split() if args.bench_args else []
+    report = run_ablation(
+        args.gguf,
+        args.llama_bench,
+        profile.unique_shapes,
+        table=args.table,
+        threshold=args.threshold,
+        n_gen=args.n_gen,
+        reps=args.reps,
+        extra_args=extra,
+        out_path=out,
+    )
+    if report.cell_results:
+        print()
+        print(f"baseline: {report.baseline_ts:.2f} tok/s")
+        for cell, ts, ratio in report.cell_results:
+            mark = "WIN " if cell in report.winners else "    "
+            print(f"  {mark}{cell.key:24s} {ts:8.2f} tok/s  {ratio:.3f}x")
+        print(f"{len(report.winners)}/{len(report.cell_results)} cells kept (threshold {args.threshold}x)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="kernel-anvil",
@@ -1167,6 +1202,20 @@ def main():
         help="Optional draft model GGUF (for speculative decoding). May be passed multiple times. "
              "Profiles target + draft together and writes a single merged config keyed under the target stem.",
     )
+
+    # ablate: ground-truth per-cell A/B on the real model + real kernel
+    p_ablate = sub.add_parser(
+        "ablate",
+        help="Ground-truth cell ablation: A/B each small_k candidate bucket cell "
+             "with real llama-bench decode runs, keep only measured winners")
+    p_ablate.add_argument("gguf", help="Path to GGUF model file")
+    p_ablate.add_argument("--llama-bench", required=True, help="Path to a smithy-patched llama-bench binary")
+    p_ablate.add_argument("--table", default="rdna3_0", choices=["rdna3_0", "rdna4"], help="GPU parameter table (default: rdna3_0)")
+    p_ablate.add_argument("--threshold", type=float, default=1.01, help="Keep cells with speedup >= this ratio (default: 1.01)")
+    p_ablate.add_argument("--n-gen", type=int, default=32, help="Decode tokens per bench (default: 32)")
+    p_ablate.add_argument("--reps", type=int, default=3, help="llama-bench repetitions (default: 3)")
+    p_ablate.add_argument("--out", default=None, help="Output config path (default: ~/.cache/smithy/<stem>.json)")
+    p_ablate.add_argument("--bench-args", default="", help="Extra llama-bench args, quoted (e.g. '-ngl 99 --n-cpu-moe 16')")
 
     # merge-configs: combine multiple cached JSON configs into one
     p_merge = sub.add_parser(
@@ -1268,6 +1317,8 @@ def main():
         cmd_merge_configs(args)
     elif args.command == "train-optimize":
         cmd_train_optimize(args)
+    elif args.command == "ablate":
+        cmd_ablate(args)
 
 
 if __name__ == "__main__":
