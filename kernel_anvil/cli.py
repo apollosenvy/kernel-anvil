@@ -370,14 +370,24 @@ def _profile_gguf_shapes(
             if (qt, n, k) in codegen_configs:
                 console.print(f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: [dim]reused[/dim]")
                 continue
-            blocks_per_row = k // 256 if k >= 256 else 1
-            if blocks_per_row < 64:
-                cfg = {"nwarps": 2, "rows_per_block": 2}
+            # Heuristic = upstream's own small_k trigger arithmetic (mirrored
+            # in cell_ablation). The runtime honors rows_per_block>1 as
+            # "force small_k for this cell", so the old blanket rows=2
+            # force-enabled the path for EVERY shape, winners and losers
+            # alike. Now only trigger-firing shapes get the bit; everything
+            # else emits rows=1 (no override at runtime).
+            from kernel_anvil.cell_ablation import (
+                small_k_nwarps, small_k_trigger_fires)
+            if small_k_trigger_fires(qt, k):
+                nw = small_k_nwarps(qt)
+                cfg = {"nwarps": nw, "rows_per_block": nw}
+                why = "small_k trigger fires"
             else:
                 cfg = {"nwarps": 4, "rows_per_block": 1}
+                why = "no trigger; runtime default"
             codegen_configs[(qt, n, k)] = cfg
             console.print(f"  {label_prefix}[{i}/{len(shapes)}] {qt} ({n}, {k}) x{count}: "
-                          f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} (heuristic)")
+                          f"nwarps={cfg['nwarps']} rows={cfg['rows_per_block']} (heuristic: {why})")
             results_table.append((label, qt, n, k, count, cfg, 0, None, 0))
         return
 
