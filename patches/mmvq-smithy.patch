@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 8d80d1d..38a71ec 100644
+index 8f55cace1..7c9b02281 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -2,6 +2,7 @@
@@ -10,24 +10,32 @@ index 8d80d1d..38a71ec 100644
  
  #include <cstdint>
  
-@@ -380,6 +381,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+@@ -385,6 +386,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
                  return 1;
          }
      }
-+    // RDNA: rpb=2 when kernel-anvil profile says so (via small_k trigger)
++    // kernel-anvil (smithy): RDNA tables mirror GENERIC's small_k behavior.
++    // Upstream's should_use_small_k blanket-disables small_k on RDNA, so on
++    // AMD this branch is only reachable when a profiled smithy config
++    // re-enabled the path for a shape measured faster with it. Host and
++    // device share this constexpr, so launch params and kernel agree.
 +    if (small_k && ncols_dst == 1) {
-+        return 2;
++        return nwarps;
 +    }
      return 1;
  }
  
-@@ -774,6 +779,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -779,6 +788,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
              use = false;
          }
  
-+        // kernel-anvil override: if smithy config says rpb>1 for this shape, force small_k
++        // kernel-anvil (smithy) per-shape override: a profiled config can
++        // re-enable small_k where the blanket rules above (notably the
++        // RDNA disable) leave measured speedup on the table for this GPU +
++        // model's specific (type, nrows, ncols). Absent config = no-op.
++        // Only forces the path ON, never off, matching the original patch.
 +        if (!use && c_ncols_dst == 1) {
-+            smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
++            const smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
 +            if (scfg.rows_per_block > 1) {
 +                use = true;
 +            }
