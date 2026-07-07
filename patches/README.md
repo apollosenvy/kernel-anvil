@@ -10,6 +10,11 @@ lets llama.cpp load them at startup.
 `[[maybe_unused]]`, and capture lambdas). llama.cpp's CMake already targets
 C++17 by default, so no extra flags are needed for the upstream tree.
 
+Your llama.cpp must be recent enough that `calc_rows_per_block` takes a
+`bool small_k` parameter (mid-2026 upstream, including the ROCm/TheRock
+fork). On older trees the patch's context will not match and `apply.sh`
+will tell you to update.
+
 ## Quick Apply
 
 ```bash
@@ -32,20 +37,37 @@ Copy `patches/smithy-config.h` to `ggml/src/ggml-cuda/smithy-config.h` in your l
 #include "smithy-config.h"
 ```
 
-**In `calc_rows_per_block`**, add before the final `return 1;`:
+**In `calc_rows_per_block`**, add before the final `return 1;`.
+
+> **Careful about the neighboring function.** `calc_nwarps`, directly above,
+> ends with an identical `return 1; }` tail. Make sure you are editing the
+> function with this exact signature:
+> `static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1)`
+> If `small_k` is not a parameter of the function you are editing, you are in
+> the wrong function and the build will fail with
+> `use of undeclared identifier 'small_k'` (see issue #13).
+
 ```cpp
-    // RDNA: rpb=2 when kernel-anvil profile says so (via small_k trigger)
+    // kernel-anvil (smithy): RDNA tables mirror GENERIC's small_k behavior.
+    // Upstream's should_use_small_k blanket-disables small_k on RDNA, so on
+    // AMD this branch is only reachable when a profiled smithy config
+    // re-enabled the path for a shape measured faster with it. Host and
+    // device share this constexpr, so launch params and kernel agree.
     if (small_k && ncols_dst == 1) {
-        return 2;
+        return nwarps;
     }
 ```
 
 **In the `should_use_small_k` lambda** (inside `mul_mat_vec_q_switch_ncols_dst`),
 add before `return use;`:
 ```cpp
-        // kernel-anvil override: if smithy config says rpb>1 for this shape, force small_k
+        // kernel-anvil (smithy) per-shape override: a profiled config can
+        // re-enable small_k where the blanket rules above (notably the
+        // RDNA disable) leave measured speedup on the table for this GPU +
+        // model's specific (type, nrows, ncols). Absent config = no-op.
+        // Only forces the path ON, never off, matching the original patch.
         if (!use && c_ncols_dst == 1) {
-            smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
+            const smithy_shape_config scfg = smithy_lookup(type, nrows_x, ncols_x);
             if (scfg.rows_per_block > 1) {
                 use = true;
             }
@@ -66,8 +88,8 @@ The patch is ~15 lines of actual code change:
 1. `smithy-config.h` loads a JSON config file at first kernel dispatch
 2. For decode (batch=1), it checks if kernel-anvil profiled this shape
 3. If the config says `rows_per_block > 1`, it triggers the `small_k` kernel
-   variant which processes 2 rows per block instead of 1
-4. This halves the number of kernel launches and improves occupancy
+   variant which processes multiple rows per block (`nwarps`) instead of 1
+4. This cuts the number of kernel launches and improves occupancy
 
 Without a config file, behavior is identical to stock llama.cpp.
 
