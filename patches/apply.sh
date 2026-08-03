@@ -1,6 +1,12 @@
 #!/bin/bash
 # Apply kernel-anvil runtime config patch to llama.cpp
 # Usage: ./apply.sh /path/to/llama.cpp
+#
+# Applies in two phases:
+#   1. Core MMVQ patch (required) — adds smithy-config.h + kernel dispatch hook
+#   2. Router-mode patches (optional) — enables per-model smithy-config in models.ini
+#      If the router patches don't apply (older llama.cpp without router mode,
+#      or upstream API drift), the core single-model SMITHY_CONFIG flow still works.
 
 set -e
 
@@ -58,6 +64,37 @@ else
     exit 1
 fi
 
+# ── Router-mode patches (optional) ──────────────────────────────────────
+# Enables `smithy-config = <path>` per model section in models.ini. The router
+# injects SMITHY_CONFIG as an env var when spawning each child process.
+# Non-fatal: if these don't apply (older llama.cpp without router mode, or
+# upstream API drift), the core single-model SMITHY_CONFIG env var still works.
+ROUTER_PATCHES=(
+    arg-h-smithy-router.patch
+    arg-cpp-smithy-router.patch
+    server-models-cpp-smithy-router.patch
+)
+ROUTER_APPLIED=0
+ROUTER_FAILED=0
+
+for p in "${ROUTER_PATCHES[@]}"; do
+    if [ ! -f "$SCRIPT_DIR/$p" ]; then
+        echo "Warning: $p not found, skipping"
+        ROUTER_FAILED=1
+        continue
+    fi
+    if git apply --check "$SCRIPT_DIR/$p" 2>/dev/null; then
+        git apply "$SCRIPT_DIR/$p"
+        echo "Applied $p"
+        ROUTER_APPLIED=$((ROUTER_APPLIED + 1))
+    else
+        echo "Warning: $p doesn't apply cleanly (llama.cpp version mismatch or no router mode)."
+        echo "  Per-model smithy-config in models.ini will not be available."
+        echo "  Single-model SMITHY_CONFIG env var still works."
+        ROUTER_FAILED=1
+    fi
+done
+
 echo ""
 echo "Done! Now rebuild llama.cpp with HIP:"
 echo "  cd $LLAMA_CPP"
@@ -67,3 +104,9 @@ echo ""
 echo "Then run with kernel-anvil configs:"
 echo "  kernel-anvil gguf-optimize model.gguf"
 echo "  SMITHY_CONFIG=~/.cache/smithy/model.json ./build/bin/llama-server -m model.gguf -ngl 999"
+if [ "$ROUTER_APPLIED" -gt 0 ] && [ "$ROUTER_FAILED" -eq 0 ]; then
+    echo ""
+    echo "Router mode (per-model configs via models.ini):"
+    echo "  Add 'smithy-config = ~/.cache/smithy/model.json' to each model section"
+    echo "  See patches/README.md for details"
+fi

@@ -1,0 +1,15 @@
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4568,6 +4568,12 @@
+         [](common_params &, int) { /* unused */ }
+     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+ 
++    args.push_back(common_arg(
++        {"smithy-config"}, "PATH",
++        "path to smithy per-model kernel config JSON (router mode: injected as SMITHY_CONFIG env for the child process)",
++        [](common_params &, const std::string &) { /* unused */ }
++    ).set_env(COMMON_ARG_PRESET_SMITHY_CONFIG).set_preset_only());
++
+     // args.push_back(common_arg(
+     //     {"pin"},
+     //     "in server router mode, do not unload this model if models_max is exceeded",
