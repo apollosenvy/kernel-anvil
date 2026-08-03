@@ -4,6 +4,22 @@ This patch adds runtime shape-specific MMVQ kernel configuration to llama.cpp.
 When kernel-anvil generates optimized configs for your model + GPU, this patch
 lets llama.cpp load them at startup.
 
+## Patch Files
+
+| File | Target | Required | Purpose |
+|------|--------|----------|---------|
+| `smithy-config.h` | `ggml/src/ggml-cuda/` | Yes | Config loader header (3-tier JSON lookup) |
+| `mmvq-smithy.patch` | `ggml/src/ggml-cuda/mmvq.cu` | Yes | Hooks `smithy_lookup()` into MMVQ dispatch |
+| `arg-h-smithy-router.patch` | `common/arg.h` | No | Registers `smithy-config` pseudo-env for models.ini |
+| `arg-cpp-smithy-router.patch` | `common/arg.cpp` | No | Accepts `smithy-config` as a preset-only INI option |
+| `server-models-cpp-smithy-router.patch` | `tools/server/server-models.cpp` | No | Injects `SMITHY_CONFIG` env at child spawn |
+
+The three `*-router.patch` files enable per-model smithy config in llama.cpp's
+router mode (multiple models loaded concurrently). They are applied
+automatically by `apply.sh` when the llama.cpp source supports router mode;
+on older trees they are silently skipped and the single-model `SMITHY_CONFIG`
+env var still works.
+
 ## Requirements
 
 `smithy-config.h` requires **C++17** (uses `std::atomic`, `std::shared_mutex`,
@@ -120,4 +136,60 @@ Generate configs with:
 kernel-anvil gguf-optimize model.gguf
 # or for full benchmarking:
 kernel-anvil autoforge model.gguf --llama-cpp-path /path/to/llama.cpp
+```
+
+## Router Mode (Per-Model Configs)
+
+When running `llama-server` in router mode (multiple models loaded
+concurrently), the `SMITHY_CONFIG` env var is process-wide and cannot vary
+per model. The three `*-router.patch` files add a `smithy-config` key to
+`models.ini` so each model section can point to its own config JSON:
+
+```ini
+[unsloth/Qwen3.6-27B-MTP-Vulkan-GGUF:Q8_K_XL]
+smithy-config = ~/.cache/smithy/Qwen3.6-27B-MTP-Vulkan-GGUF.json
+
+[satgeze/Hy3-1M-GGUF-tuned:Q4_K_M]
+smithy-config = /models/smithy-cache/Hy3-1M-GGUF-tuned.json
+```
+
+### How it works
+
+1. `arg-h-smithy-router.patch` + `arg-cpp-smithy-router.patch` register
+   `smithy-config` as a preset-only INI option (like `load-on-startup`).
+   This passes the INI parser's key validation without adding a CLI arg.
+2. `server-models-cpp-smithy-router.patch` reads the value at child spawn
+   and injects it as `SMITHY_CONFIG=<path>` into the child process
+   environment.
+3. The child's existing `smithy-config.h` picks up `SMITHY_CONFIG` as
+   priority 1 in its 3-tier lookup — no changes to the loader needed.
+
+Models without a `smithy-config` key fall back to the default lookup chain
+(per-model-stem JSON, then `default.json`).
+
+### Manual Apply (if router patches don't apply via `apply.sh`)
+
+**`common/arg.h`** — add after the existing `COMMON_ARG_PRESET_*` defines:
+```cpp
+#define COMMON_ARG_PRESET_SMITHY_CONFIG  "__PRESET_SMITHY_CONFIG"
+```
+
+**`common/arg.cpp`** — in `common_params_add_preset_options()`, add after the
+`stop-timeout` entry:
+```cpp
+args.push_back(common_arg(
+    {"smithy-config"}, "PATH",
+    "path to smithy per-model kernel config JSON (router mode: injected as SMITHY_CONFIG env for the child process)",
+    [](common_params &, const std::string &) { /* unused */ }
+).set_env(COMMON_ARG_PRESET_SMITHY_CONFIG).set_preset_only());
+```
+
+**`tools/server/server-models.cpp`** — in `server_models::load()`, after
+`child_env = base_env;` and the `LLAMA_SERVER_ROUTER_PORT` push:
+```cpp
+// Inject per-model smithy config as SMITHY_CONFIG env var for the child
+std::string smithy_path;
+if (inst.meta.preset.get_option(COMMON_ARG_PRESET_SMITHY_CONFIG, smithy_path) && !smithy_path.empty()) {
+    child_env.push_back("SMITHY_CONFIG=" + smithy_path);
+}
 ```
