@@ -15,6 +15,16 @@ Your llama.cpp must be recent enough that `calc_rows_per_block` takes a
 fork). On older trees the patch's context will not match and `apply.sh`
 will tell you to update.
 
+Two variants of the patch ship, same hook, different context:
+
+| File | Applies to |
+|------|------------|
+| `mmvq-smithy.patch` | ggml-org master from 2026-08-18 (commit `25ae3a9b3`, the GB10 MMVQ table) onward |
+| `mmvq-smithy-pre-gb10.patch` | trees before that commit, including the ROCm/TheRock fork as of 2026-09 |
+
+`apply.sh` tries them in that order and reports which one it used. If you
+apply by hand, either file's hunks are the manual steps below.
+
 ## Quick Apply
 
 ```bash

@@ -29,13 +29,25 @@ echo "Copied smithy-config.h"
 # Apply mmvq.cu patch (keep a backup so a bad apply never leaves a broken tree)
 cp "$MMVQ" "$MMVQ.anvil-orig"
 cd "$LLAMA_CPP"
-if ! git apply --check "$SCRIPT_DIR/mmvq-smithy.patch" 2>/dev/null; then
+# Two variants of the same hook. Upstream commit 25ae3a9b3 (2026-08-18, GB10
+# MMVQ table) changed the calc_rows_per_block context our hunk anchors on, so
+# trees from before it (including the ROCm/TheRock fork as of 2026-09) need the
+# pre-gb10 file. Try current first; whichever applies cleanly is used.
+PATCH=""
+for candidate in mmvq-smithy.patch mmvq-smithy-pre-gb10.patch; do
+    if git apply --check "$SCRIPT_DIR/$candidate" 2>/dev/null; then
+        PATCH="$candidate"
+        break
+    fi
+done
+if [ -z "$PATCH" ]; then
     rm -f "$MMVQ.anvil-orig"
-    echo "Patch doesn't apply cleanly (llama.cpp version mismatch)."
+    echo "Neither patch variant applies cleanly (llama.cpp version mismatch)."
     manual_steps
     exit 1
 fi
-git apply "$SCRIPT_DIR/mmvq-smithy.patch"
+git apply "$SCRIPT_DIR/$PATCH"
+echo "Applied $PATCH"
 
 # Verify placement (issue #13): calc_nwarps, directly above calc_rows_per_block,
 # ends with an identical 'return 1; }' tail. If context drift ever lands the
@@ -48,7 +60,7 @@ if awk '
     END { exit !(sig && ins && lut && ins > sig && ins < sig + 40) }
 ' "$MMVQ"; then
     rm -f "$MMVQ.anvil-orig"
-    echo "Applied mmvq-smithy.patch (placement verified)"
+    echo "Applied $PATCH (placement verified)"
 else
     mv "$MMVQ.anvil-orig" "$MMVQ"
     echo "Error: patch applied but the small_k block did not land inside"
