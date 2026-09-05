@@ -15,10 +15,12 @@ lets llama.cpp load them at startup.
 | `server-models-cpp-smithy-router.patch` | `tools/server/server-models.cpp` | No | Injects `SMITHY_CONFIG` env at child spawn |
 
 The three `*-router.patch` files enable per-model smithy config in llama.cpp's
-router mode (multiple models loaded concurrently). They are applied
-automatically by `apply.sh` when the llama.cpp source supports router mode;
-on older trees they are silently skipped and the single-model `SMITHY_CONFIG`
-env var still works.
+router mode (multiple models loaded concurrently). `apply.sh` checks all three
+against your tree first and applies them all or none: `arg.cpp` uses the define
+that `arg.h` adds and `server-models.cpp` uses both, so a partial apply would be
+a build break, not a degraded feature. When any of them does not apply (older
+tree without router mode, or upstream drift) apply.sh says so, skips the set,
+and the single-model `SMITHY_CONFIG` env var still works.
 
 ## Requirements
 
@@ -172,29 +174,36 @@ smithy-config = /models/smithy-cache/Hy3-1M-GGUF-tuned.json
    and injects it as `SMITHY_CONFIG=<path>` into the child process
    environment.
 3. The child's existing `smithy-config.h` picks up `SMITHY_CONFIG` as
-   priority 1 in its 3-tier lookup — no changes to the loader needed.
+   priority 1 in its 3-tier lookup, no changes to the loader needed.
 
 Models without a `smithy-config` key fall back to the default lookup chain
 (per-model-stem JSON, then `default.json`).
 
 ### Manual Apply (if router patches don't apply via `apply.sh`)
 
-**`common/arg.h`** — add after the existing `COMMON_ARG_PRESET_*` defines:
+**`common/arg.h`**: add directly above the
+`// pseudo-env variable to identify preset-only arguments` comment (the patch
+anchors there on purpose: upstream appends new presets at the END of that
+define block and realigns it, which is what broke the first version of this
+patch):
 ```cpp
-#define COMMON_ARG_PRESET_SMITHY_CONFIG  "__PRESET_SMITHY_CONFIG"
+// kernel-anvil (smithy): preset-only `smithy-config` key in models.ini; the
+// router injects it as SMITHY_CONFIG into the child's environment.
+#define COMMON_ARG_PRESET_SMITHY_CONFIG "__PRESET_SMITHY_CONFIG"
 ```
 
-**`common/arg.cpp`** — in `common_params_add_preset_options()`, add after the
-`stop-timeout` entry:
+**`common/arg.cpp`**: in `common_params_add_preset_options()`, add as the FIRST
+entry, right after the `// arguments below won't be treated as CLI args` comment
+(same reason: the end of the list is where upstream adds things):
 ```cpp
 args.push_back(common_arg(
     {"smithy-config"}, "PATH",
-    "path to smithy per-model kernel config JSON (router mode: injected as SMITHY_CONFIG env for the child process)",
+    "in server router mode, kernel-anvil per-model MMVQ config JSON, injected as SMITHY_CONFIG into the child process",
     [](common_params &, const std::string &) { /* unused */ }
 ).set_env(COMMON_ARG_PRESET_SMITHY_CONFIG).set_preset_only());
 ```
 
-**`tools/server/server-models.cpp`** — in `server_models::load()`, after
+**`tools/server/server-models.cpp`**: in `server_models::load()`, after
 `child_env = base_env;` and the `LLAMA_SERVER_ROUTER_PORT` push:
 ```cpp
 // Inject per-model smithy config as SMITHY_CONFIG env var for the child

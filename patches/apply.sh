@@ -3,8 +3,8 @@
 # Usage: ./apply.sh /path/to/llama.cpp
 #
 # Applies in two phases:
-#   1. Core MMVQ patch (required) — adds smithy-config.h + kernel dispatch hook
-#   2. Router-mode patches (optional) — enables per-model smithy-config in models.ini
+#   1. Core MMVQ patch (required), adds smithy-config.h + kernel dispatch hook
+#   2. Router-mode patches (optional), enables per-model smithy-config in models.ini
 #      If the router patches don't apply (older llama.cpp without router mode,
 #      or upstream API drift), the core single-model SMITHY_CONFIG flow still works.
 
@@ -89,23 +89,29 @@ ROUTER_PATCHES=(
 ROUTER_APPLIED=0
 ROUTER_FAILED=0
 
+# All or none: arg.cpp uses the define that arg.h adds and server-models.cpp
+# uses both, so a partial apply (one hunk drifted, the others not) is a build
+# break, not a degraded feature. Check every file first, then apply.
 for p in "${ROUTER_PATCHES[@]}"; do
     if [ ! -f "$SCRIPT_DIR/$p" ]; then
-        echo "Warning: $p not found, skipping"
+        echo "Warning: $p not found; router-mode patches skipped."
         ROUTER_FAILED=1
-        continue
-    fi
-    if git apply --check "$SCRIPT_DIR/$p" 2>/dev/null; then
-        git apply "$SCRIPT_DIR/$p"
-        echo "Applied $p"
-        ROUTER_APPLIED=$((ROUTER_APPLIED + 1))
-    else
+    elif ! git apply --check "$SCRIPT_DIR/$p" 2>/dev/null; then
         echo "Warning: $p doesn't apply cleanly (llama.cpp version mismatch or no router mode)."
-        echo "  Per-model smithy-config in models.ini will not be available."
-        echo "  Single-model SMITHY_CONFIG env var still works."
         ROUTER_FAILED=1
     fi
 done
+if [ "$ROUTER_FAILED" -eq 0 ]; then
+    for p in "${ROUTER_PATCHES[@]}"; do
+        git apply "$SCRIPT_DIR/$p"
+        echo "Applied $p"
+        ROUTER_APPLIED=$((ROUTER_APPLIED + 1))
+    done
+else
+    echo "  Router-mode patches were NOT applied (none of the three)."
+    echo "  Per-model smithy-config in models.ini will not be available."
+    echo "  Single-model SMITHY_CONFIG env var still works."
+fi
 
 echo ""
 echo "Done! Now rebuild llama.cpp with HIP:"
