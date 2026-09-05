@@ -50,6 +50,17 @@ On startup:
 kernel-anvil: loaded 6 shape configs from ~/.cache/smithy/Qwen3-8B-Q4_K_M.json
 ```
 
+### To support multiple optimized configs when in router mode
+
+my-models.ini
+```
+smithy-config = ~/.cache/smithy/Qwen3-8B-Q4_K_M.json
+```
+
+```bash
+llama-server --models-preset ./my-models.ini
+```
+
 ### Speculative decoding (target + draft)
 
 llama.cpp's speculative decoding loads two models concurrently (a large target plus a small draft). Both run through the same MMVQ dispatch path, so a single merged config covers both.
