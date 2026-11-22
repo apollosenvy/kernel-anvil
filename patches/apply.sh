@@ -35,12 +35,10 @@ echo "Copied smithy-config.h"
 # Apply mmvq.cu patch (keep a backup so a bad apply never leaves a broken tree)
 cp "$MMVQ" "$MMVQ.anvil-orig"
 cd "$LLAMA_CPP"
-# Two variants of the same hook. Upstream commit 25ae3a9b3 (2026-08-18, GB10
-# MMVQ table) changed the calc_rows_per_block context our hunk anchors on, so
-# trees from before it (including the ROCm/TheRock fork as of 2026-09) need the
-# pre-gb10 file. Try current first; whichever applies cleanly is used.
+# Newer upstream passes the quantization type to calc_rows_per_block.
+# Older upstream uses the GB10 variant, or pre-GB10 before 25ae3a9b3.
 PATCH=""
-for candidate in mmvq-smithy.patch mmvq-smithy-pre-gb10.patch; do
+for candidate in mmvq-smithy-typed.patch mmvq-smithy.patch mmvq-smithy-pre-gb10.patch; do
     if git apply --check "$SCRIPT_DIR/$candidate" 2>/dev/null; then
         PATCH="$candidate"
         break
@@ -48,7 +46,14 @@ for candidate in mmvq-smithy.patch mmvq-smithy-pre-gb10.patch; do
 done
 if [ -z "$PATCH" ]; then
     rm -f "$MMVQ.anvil-orig"
-    echo "Neither patch variant applies cleanly (llama.cpp version mismatch)."
+    # Don't advise hand-installing a second hook on an already patched tree.
+    for candidate in "$SCRIPT_DIR"/mmvq-smithy*.patch; do
+        if git apply --reverse --check "$candidate" 2>/dev/null; then
+            echo "MMVQ hook already installed. No patches applied on this run."
+            exit 0
+        fi
+    done
+    echo "No MMVQ patch variant applies cleanly (llama.cpp version mismatch)."
     manual_steps
     exit 1
 fi
@@ -60,7 +65,7 @@ echo "Applied $PATCH"
 # small_k block outside calc_rows_per_block, small_k/nwarps are undeclared and
 # the build breaks. Check the insertion sits below the right signature.
 if awk '
-    /int calc_rows_per_block\(int ncols_dst, int table_id, bool small_k/ { sig = NR }
+    /int calc_rows_per_block\((ggml_type type, )?int ncols_dst, int table_id, bool small_k/ { sig = NR }
     /if \(small_k && ncols_dst == 1\) \{/                                { ins = NR }
     /smithy_lookup\(type, nrows_x, ncols_x\)/                            { lut = NR }
     END { exit !(sig && ins && lut && ins > sig && ins < sig + 40) }

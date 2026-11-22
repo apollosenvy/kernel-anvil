@@ -1,8 +1,9 @@
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+index 5d5992c08..b5649b872 100644
 --- a/tools/server/server-models.cpp
 +++ b/tools/server/server-models.cpp
-@@ -802,6 +802,12 @@
-         std::vector<std::string> child_env  = base_env; // copy
-         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+@@ -1280,4 +1280,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
+         }
  
 +        // Inject per-model smithy config as SMITHY_CONFIG env var for the child
 +        std::string smithy_path;
@@ -10,6 +11,5 @@
 +            child_env.push_back("SMITHY_CONFIG=" + smithy_path);
 +        }
 +
-         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
-             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
-             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
+         SRV_INF("%s", "spawning server instance with args:\n");
+         for (const auto & arg : child_args) {
