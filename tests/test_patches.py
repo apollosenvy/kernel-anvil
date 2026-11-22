@@ -297,8 +297,8 @@ def test_apply_sh_router_patches_are_all_or_none(tmp_path):  # state: no half ap
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-@pytest.mark.parametrize("variant", ["mmvq-smithy.patch", "mmvq-smithy-pre-gb10.patch"])
-def test_apply_sh_places_small_k_with_either_variant(tmp_path, variant):  # boundary: tree age
+@pytest.mark.parametrize("variant", ["mmvq-smithy-typed.patch", "mmvq-smithy.patch", "mmvq-smithy-pre-gb10.patch"])
+def test_apply_sh_places_small_k_with_each_variant(tmp_path, variant):  # boundary: tree age
     tree = _fixture_tree(tmp_path, variant, with_router=False)
     r = _run_apply(tree)
     assert r.returncode == 0, f"apply.sh failed on a {variant} tree:\n{r.stdout}\n{r.stderr}"
@@ -307,7 +307,7 @@ def test_apply_sh_places_small_k_with_either_variant(tmp_path, variant):  # boun
         f"placement verified; output:\n{r.stdout}"
     )
     mmvq = (tree / "ggml/src/ggml-cuda/mmvq.cu").read_text()
-    sig = mmvq.index(CALC_RPB_SIGNATURE)
+    sig = mmvq.index("int calc_rows_per_block(")
     ins = mmvq.index(INSERT_MARKER)
     assert 0 < ins - sig < 2000, (
         f"placement violated on {variant}: small_k block at {ins}, "
@@ -316,6 +316,10 @@ def test_apply_sh_places_small_k_with_either_variant(tmp_path, variant):  # boun
     assert "smithy_lookup(type, nrows_x, ncols_x)" in mmvq, (
         f"{variant} did not install the dispatch-site lookup"
     )
+
+    again = _run_apply(tree)
+    assert again.returncode == 0 and "already installed" in again.stdout
+    assert (tree / "ggml/src/ggml-cuda/mmvq.cu").read_text() == mmvq
 
 
 # SABOTAGE LOG (deep-tests), 2026-09-05, router patches + core variants

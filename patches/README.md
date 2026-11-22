@@ -33,15 +33,16 @@ Your llama.cpp must be recent enough that `calc_rows_per_block` takes a
 fork). On older trees the patch's context will not match and `apply.sh`
 will tell you to update.
 
-Two variants of the patch ship, same hook, different context:
+Three variants of the patch ship, same hook, different context:
 
 | File | Applies to |
 |------|------------|
-| `mmvq-smithy.patch` | ggml-org master from 2026-08-18 (commit `25ae3a9b3`, the GB10 MMVQ table) onward |
+| `mmvq-smithy-typed.patch` | type-aware `calc_rows_per_block` (verified at `225a5345b`) |
+| `mmvq-smithy.patch` | older signature from 2026-08-18 (commit `25ae3a9b3`, the GB10 MMVQ table) |
 | `mmvq-smithy-pre-gb10.patch` | trees before that commit, including the ROCm/TheRock fork as of 2026-09 |
 
 `apply.sh` tries them in that order and reports which one it used. If you
-apply by hand, either file's hunks are the manual steps below.
+apply by hand, the matching file's hunks are the manual steps below.
 
 ## Quick Apply
 
@@ -65,11 +66,11 @@ Copy `patches/smithy-config.h` to `ggml/src/ggml-cuda/smithy-config.h` in your l
 #include "smithy-config.h"
 ```
 
-**In `calc_rows_per_block`**, add before the final `return 1;`.
+**In `calc_rows_per_block`**, add the block below at function entry on type-aware trees (first parameter `ggml_type type`), or before the final `return 1;` on older trees.
 
 > **Careful about the neighboring function.** `calc_nwarps`, directly above,
 > ends with an identical `return 1; }` tail. Make sure you are editing the
-> function with this exact signature:
+> function with this signature (newer trees add a leading `ggml_type type`):
 > `static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1)`
 > If `small_k` is not a parameter of the function you are editing, you are in
 > the wrong function and the build will fail with
